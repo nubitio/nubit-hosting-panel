@@ -210,3 +210,20 @@ fn ensure_host(value: &str) -> Result<()> {
 fn sql_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "''")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convention_names_defaults_to_underscored_identifiers() {
+        let (db, user) = convention_names("portero-seguro", "web", "prod").unwrap();
+        assert_eq!(db, "portero_seguro_web_prod");
+        assert_eq!(user, "portero_seguro_web_user");
+    }
+
+    #[test]
+    fn convention_names_rejects_invalid_slug() {
+        assert!(convention_names("Portero", "web", "prod").is_err());
+    }
+}

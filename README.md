@@ -17,6 +17,7 @@
 - DB servers sin secretos en SQLite.
 - Credenciales DB por env var o `config.toml`; env var tiene prioridad.
 - MariaDB/MySQL: crear databases, crear usuarios, grants, provision, reset password, backup y restore local.
+- CI con `cargo fmt --check`, `cargo clippy` y `cargo test`.
 - GitHub Actions release Linux-only con artefactos `.tar.gz`, checksums e `install.sh`.
 
 ## Uso local

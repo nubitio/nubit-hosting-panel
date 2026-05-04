@@ -119,3 +119,26 @@ fn import_target(cfg: &Config) -> String {
         .unwrap_or("hostingctl.caddy")
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::App;
+    use chrono::Utc;
+
+    #[test]
+    fn render_block_contains_app_proxy() {
+        let rendered = render_block(&[App {
+            id: "app-1".into(),
+            client_slug: "porteroseguro".into(),
+            slug: "web".into(),
+            domain: "porteroseguro.nubit.site".into(),
+            upstream: "tomcat_porteroseguro:8080".into(),
+            created_at: Utc::now(),
+        }]);
+
+        assert!(rendered.contains("# This file is managed by hostingctl"));
+        assert!(rendered.contains("porteroseguro.nubit.site"));
+        assert!(rendered.contains("reverse_proxy tomcat_porteroseguro:8080"));
+    }
+}

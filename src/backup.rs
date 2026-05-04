@@ -198,3 +198,27 @@ fn creds(cfg: &Config, server: &DbServer) -> Result<DbCreds> {
         password: parsed.password().map(str::to_string),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_backups_finds_sql_and_sql_gz() {
+        let root = std::env::temp_dir().join(format!("hostingctl-test-{}", uuid::Uuid::new_v4()));
+        let db_dir = root.join("mariadb").join("app_db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::write(db_dir.join("a.sql"), "-- dump").unwrap();
+        std::fs::write(db_dir.join("b.sql.gz"), "not checked here").unwrap();
+        std::fs::write(db_dir.join("ignore.txt"), "x").unwrap();
+
+        let files = list_backups(&root, Some("mariadb"), Some("app_db")).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(names, vec!["a.sql", "b.sql.gz"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

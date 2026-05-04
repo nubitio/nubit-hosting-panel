@@ -362,3 +362,23 @@ fn parse_dt(raw: String) -> rusqlite::Result<DateTime<Utc>> {
             rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_slug_accepts_safe_values() {
+        assert!(validate_slug("porteroseguro").is_ok());
+        assert!(validate_slug("cliente-123").is_ok());
+        assert!(validate_slug("cliente_123").is_ok());
+    }
+
+    #[test]
+    fn validate_slug_rejects_unsafe_values() {
+        assert!(validate_slug("").is_err());
+        assert!(validate_slug("PorteroSeguro").is_err());
+        assert!(validate_slug("portero seguro").is_err());
+        assert!(validate_slug("../x").is_err());
+    }
+}
