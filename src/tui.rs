@@ -287,6 +287,7 @@ struct TuiState {
     doctor_checks: Vec<doctor::Check>,
     doctor_loaded: bool,
     sys_info: SysInfo,
+    last_sys_refresh: std::time::Instant,
     clients_table: TableState,
     apps_table: TableState,
     db_table: TableState,
@@ -308,6 +309,7 @@ impl TuiState {
             doctor_checks,
             doctor_loaded: true,
             sys_info: load_sys_info(),
+            last_sys_refresh: std::time::Instant::now(),
             clients_table: TableState::default(),
             apps_table: TableState::default(),
             db_table: TableState::default(),
@@ -326,6 +328,7 @@ impl TuiState {
         self.doctor_checks = doctor::run(cfg, store).unwrap_or_default();
         self.doctor_loaded = true;
         self.sys_info = load_sys_info();
+        self.last_sys_refresh = std::time::Instant::now();
         Ok(())
     }
 
@@ -740,6 +743,13 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
     let mut state = TuiState::load(store, cfg)?;
 
     let result = loop {
+        // Auto-refresh sys info every 3 seconds
+        let now = std::time::Instant::now();
+        if now.duration_since(state.last_sys_refresh) >= std::time::Duration::from_secs(3) {
+            state.sys_info = load_sys_info();
+            state.last_sys_refresh = now;
+        }
+
         terminal.draw(|frame| draw(frame, &mut state))?;
 
         if event::poll(std::time::Duration::from_millis(250))? {
