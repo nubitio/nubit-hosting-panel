@@ -38,7 +38,11 @@ impl Config {
         }
         let raw =
             fs::read_to_string(&path).wrap_err_with(|| format!("leyendo {}", path.display()))?;
-        toml::from_str(&raw).wrap_err_with(|| format!("parseando {}", path.display()))
+        let cfg: Self =
+            toml::from_str(&raw).wrap_err_with(|| format!("parseando {}", path.display()))?;
+        // Re-escribir siempre: agrega campos nuevos con defaults, preserva existentes
+        cfg.save()?;
+        Ok(cfg)
     }
 
     pub fn default() -> Result<Self> {
