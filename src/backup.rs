@@ -9,21 +9,82 @@ use color_eyre::eyre::{Context, Result, bail, eyre};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use url::Url;
 
-use crate::{config::Config, db, store::DbServer};
+use crate::{
+    config::Config,
+    mssql,
+    store::{DbServer, ensure_identifier},
+};
 
 struct DbCreds {
     username: String,
     password: Option<String>,
 }
 
+// ── Public dispatch ───────────────────────────────────────────────────────────
+
 pub fn backup(cfg: &Config, server: &DbServer, database: &str, out_dir: &Path) -> Result<PathBuf> {
-    db::ensure_identifier(database)?;
-    let creds = creds(cfg, server)?;
+    match server.kind.as_str() {
+        "mariadb" | "mysql" => mariadb_backup(cfg, server, database, out_dir),
+        "mssql" => mssql_backup(cfg, server, database, out_dir),
+        k => bail!("DB kind no soportado para backup: {}", k),
+    }
+}
+
+pub fn restore(cfg: &Config, server: &DbServer, database: &str, dump_path: &Path) -> Result<()> {
+    match server.kind.as_str() {
+        "mariadb" | "mysql" => mariadb_restore(cfg, server, database, dump_path),
+        "mssql" => mssql_restore(cfg, server, database, dump_path),
+        k => bail!("DB kind no soportado para restore: {}", k),
+    }
+}
+
+pub fn dry_run_restore(
+    cfg: &Config,
+    server: &DbServer,
+    database: &str,
+    dump_path: &Path,
+) -> Result<()> {
+    match server.kind.as_str() {
+        "mariadb" | "mysql" => mariadb_dry_run(cfg, server, database, dump_path),
+        "mssql" => mssql_dry_run(server, database, dump_path),
+        k => bail!("DB kind no soportado para dry-run: {}", k),
+    }
+}
+
+pub fn list_backups(
+    out_dir: &Path,
+    server: Option<&str>,
+    database: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let root = match (server, database) {
+        (Some(s), Some(d)) => out_dir.join(s).join(d),
+        (Some(s), None) => out_dir.join(s),
+        (None, _) => out_dir.to_path_buf(),
+    };
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    collect_dumps(&root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+// ── MariaDB backup / restore ──────────────────────────────────────────────────
+
+fn mariadb_backup(
+    cfg: &Config,
+    server: &DbServer,
+    database: &str,
+    out_dir: &Path,
+) -> Result<PathBuf> {
+    ensure_identifier(database)?;
+    let creds = mariadb_creds(cfg, server)?;
     let target_dir = out_dir.join(&server.name).join(database);
-    std::fs::create_dir_all(&target_dir)?;
+    fs::create_dir_all(&target_dir)?;
     let target = target_dir.join(format!("{}.sql.gz", Utc::now().format("%Y%m%d-%H%M%S")));
 
-    let mut cmd = docker_exec_base(server, creds.password.as_deref());
+    let mut cmd = docker_exec_base(server, creds.password.as_deref(), "MYSQL_PWD");
     cmd.arg("mariadb-dump")
         .arg("--single-transaction")
         .arg("--routines")
@@ -49,21 +110,24 @@ pub fn backup(cfg: &Config, server: &DbServer, database: &str, out_dir: &Path) -
 
     let status = child.wait()?;
     if !status.success() {
-        let _ = std::fs::remove_file(&target);
+        let _ = fs::remove_file(&target);
         bail!("mariadb-dump falló para `{}`", database);
     }
-
     Ok(target)
 }
 
-pub fn restore(cfg: &Config, server: &DbServer, database: &str, dump_path: &Path) -> Result<()> {
+fn mariadb_restore(
+    cfg: &Config,
+    server: &DbServer,
+    database: &str,
+    dump_path: &Path,
+) -> Result<()> {
     validate_restore_input(dump_path)?;
-    db::ensure_identifier(database)?;
-    let creds = creds(cfg, server)?;
-
+    ensure_identifier(database)?;
+    let creds = mariadb_creds(cfg, server)?;
     let input = open_dump(dump_path)?;
 
-    let mut cmd = docker_exec_base(server, creds.password.as_deref());
+    let mut cmd = docker_exec_base(server, creds.password.as_deref(), "MYSQL_PWD");
     cmd.arg("mariadb")
         .arg("-u")
         .arg(&creds.username)
@@ -80,7 +144,6 @@ pub fn restore(cfg: &Config, server: &DbServer, database: &str, dump_path: &Path
         let mut reader = std::io::BufReader::new(input);
         std::io::copy(&mut reader, &mut writer)?;
     }
-
     let status = child.wait()?;
     if !status.success() {
         bail!(
@@ -92,41 +155,180 @@ pub fn restore(cfg: &Config, server: &DbServer, database: &str, dump_path: &Path
     Ok(())
 }
 
-pub fn dry_run_restore(
+fn mariadb_dry_run(
     cfg: &Config,
     server: &DbServer,
     database: &str,
     dump_path: &Path,
 ) -> Result<()> {
     validate_restore_input(dump_path)?;
-    db::ensure_identifier(database)?;
-    let _ = creds(cfg, server)?;
+    ensure_identifier(database)?;
+    let _ = mariadb_creds(cfg, server)?;
     let mut reader = std::io::BufReader::new(open_dump(dump_path)?);
     let mut sink = std::io::sink();
     std::io::copy(&mut reader, &mut sink).wrap_err("leyendo dump completo")?;
     Ok(())
 }
 
-pub fn list_backups(
-    out_dir: &Path,
-    server: Option<&str>,
-    database: Option<&str>,
-) -> Result<Vec<PathBuf>> {
-    let root = match (server, database) {
-        (Some(server), Some(database)) => out_dir.join(server).join(database),
-        (Some(server), None) => out_dir.join(server),
-        (None, _) => out_dir.to_path_buf(),
-    };
+// ── MSSQL backup / restore ────────────────────────────────────────────────────
+//
+// Strategy:
+//   backup:  docker exec sqlcmd BACKUP DATABASE → /tmp/hctl_<db>.bak
+//            docker cp container:/tmp/hctl_<db>.bak → out_dir/<db>.bak
+//            docker exec rm /tmp/hctl_<db>.bak
+//   restore: docker cp dump → container:/tmp/hctl_restore.bak
+//            docker exec sqlcmd RESTORE DATABASE
+//            docker exec rm /tmp/hctl_restore.bak
 
-    if !root.exists() {
-        return Ok(Vec::new());
+fn mssql_backup(
+    cfg: &Config,
+    server: &DbServer,
+    database: &str,
+    out_dir: &Path,
+) -> Result<PathBuf> {
+    ensure_identifier(database)?;
+    let url = mssql::get_url(cfg, server)?;
+    let parsed = Url::parse(&url)?;
+    let sa_user = parsed.username().to_string();
+    let sa_pass = parsed.password().unwrap_or("").to_string();
+
+    let target_dir = out_dir.join(&server.name).join(database);
+    fs::create_dir_all(&target_dir)?;
+    let ts = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let container_path = format!("/tmp/hctl_{database}_{ts}.bak");
+    let local_path = target_dir.join(format!("{ts}.bak"));
+
+    let sqlcmd = &cfg.mssql_sqlcmd_path;
+
+    // Execute BACKUP DATABASE inside container
+    let status = Command::new("docker")
+        .arg("exec")
+        .arg("-e")
+        .arg(format!("SQLCMDPASSWORD={sa_pass}"))
+        .arg(&server.name)
+        .arg(sqlcmd)
+        .arg("-S")
+        .arg("localhost")
+        .arg("-U")
+        .arg(&sa_user)
+        .arg("-Q")
+        .arg(format!(
+            "BACKUP DATABASE [{database}] TO DISK = N'{container_path}' WITH INIT, STATS = 10"
+        ))
+        .status()
+        .wrap_err("ejecutando sqlcmd BACKUP vía docker exec")?;
+    if !status.success() {
+        bail!("BACKUP DATABASE falló para `{}`", database);
     }
 
-    let mut files = Vec::new();
-    collect_dumps(&root, &mut files)?;
-    files.sort();
-    Ok(files)
+    // docker cp to extract the .bak
+    let status = Command::new("docker")
+        .arg("cp")
+        .arg(format!("{}:{}", server.name, container_path))
+        .arg(&local_path)
+        .status()
+        .wrap_err("docker cp extrayendo backup")?;
+    if !status.success() {
+        bail!("docker cp falló extrayendo backup de `{}`", database);
+    }
+
+    // cleanup inside container
+    let _ = Command::new("docker")
+        .arg("exec")
+        .arg(&server.name)
+        .arg("rm")
+        .arg("-f")
+        .arg(&container_path)
+        .status();
+
+    Ok(local_path)
 }
+
+fn mssql_restore(cfg: &Config, server: &DbServer, database: &str, dump_path: &Path) -> Result<()> {
+    ensure_identifier(database)?;
+    if !dump_path.exists() {
+        bail!("dump no existe: {}", dump_path.display());
+    }
+
+    let url = mssql::get_url(cfg, server)?;
+    let parsed = Url::parse(&url)?;
+    let sa_user = parsed.username().to_string();
+    let sa_pass = parsed.password().unwrap_or("").to_string();
+
+    let sqlcmd = &cfg.mssql_sqlcmd_path;
+    let container_path = format!("/tmp/hctl_restore_{database}.bak");
+
+    // Copy .bak into container
+    let status = Command::new("docker")
+        .arg("cp")
+        .arg(dump_path)
+        .arg(format!("{}:{}", server.name, container_path))
+        .status()
+        .wrap_err("docker cp copiando backup al contenedor")?;
+    if !status.success() {
+        bail!("docker cp falló copiando backup al contenedor");
+    }
+
+    // Execute RESTORE DATABASE
+    let status = Command::new("docker")
+        .arg("exec")
+        .arg("-e")
+        .arg(format!("SQLCMDPASSWORD={sa_pass}"))
+        .arg(&server.name)
+        .arg(sqlcmd)
+        .arg("-S")
+        .arg("localhost")
+        .arg("-U")
+        .arg(&sa_user)
+        .arg("-Q")
+        .arg(format!(
+            "RESTORE DATABASE [{database}] FROM DISK = N'{container_path}' WITH REPLACE, STATS = 10"
+        ))
+        .status()
+        .wrap_err("ejecutando sqlcmd RESTORE vía docker exec")?;
+
+    // cleanup regardless
+    let _ = Command::new("docker")
+        .arg("exec")
+        .arg(&server.name)
+        .arg("rm")
+        .arg("-f")
+        .arg(&container_path)
+        .status();
+
+    if !status.success() {
+        bail!("RESTORE DATABASE falló para `{}`", database);
+    }
+    Ok(())
+}
+
+fn mssql_dry_run(server: &DbServer, database: &str, dump_path: &Path) -> Result<()> {
+    ensure_identifier(database)?;
+    if !dump_path.exists() {
+        bail!("dump no existe: {}", dump_path.display());
+    }
+    if !dump_path.is_file() {
+        bail!("dump no es archivo: {}", dump_path.display());
+    }
+    let name = dump_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if !name.ends_with(".bak") {
+        bail!("MSSQL dump debe terminar en .bak: {}", dump_path.display());
+    }
+    // Check container exists
+    let status = Command::new("docker")
+        .arg("inspect")
+        .arg(&server.name)
+        .status()?;
+    if !status.success() {
+        bail!("contenedor `{}` no encontrado", server.name);
+    }
+    Ok(())
+}
+
+// ── Common helpers ────────────────────────────────────────────────────────────
 
 fn validate_restore_input(dump_path: &Path) -> Result<()> {
     if !dump_path.exists() {
@@ -165,7 +367,9 @@ fn collect_dumps(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         } else if path
             .file_name()
             .and_then(|s| s.to_str())
-            .map(|name| name.ends_with(".sql") || name.ends_with(".sql.gz"))
+            .map(|name| {
+                name.ends_with(".sql") || name.ends_with(".sql.gz") || name.ends_with(".bak")
+            })
             .unwrap_or(false)
         {
             files.push(path);
@@ -174,17 +378,17 @@ fn collect_dumps(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn docker_exec_base(server: &DbServer, password: Option<&str>) -> Command {
+fn docker_exec_base(server: &DbServer, password: Option<&str>, env_var: &str) -> Command {
     let mut cmd = Command::new("docker");
     cmd.arg("exec");
-    if let Some(password) = password {
-        cmd.arg("-e").arg(format!("MYSQL_PWD={password}"));
+    if let Some(pw) = password {
+        cmd.arg("-e").arg(format!("{env_var}={pw}"));
     }
     cmd.arg(&server.name);
     cmd
 }
 
-fn creds(cfg: &Config, server: &DbServer) -> Result<DbCreds> {
+fn mariadb_creds(cfg: &Config, server: &DbServer) -> Result<DbCreds> {
     let url = cfg.db_url(&server.name).ok_or_else(|| {
         eyre!(
             "no hay credencial para DB server `{}`; define HOSTINGCTL_DB_{}_URL",
@@ -204,13 +408,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_backups_finds_sql_and_sql_gz() {
+    fn list_backups_finds_sql_sql_gz_and_bak() {
         let root = std::env::temp_dir().join(format!("hostingctl-test-{}", uuid::Uuid::new_v4()));
         let db_dir = root.join("mariadb").join("app_db");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        std::fs::write(db_dir.join("a.sql"), "-- dump").unwrap();
-        std::fs::write(db_dir.join("b.sql.gz"), "not checked here").unwrap();
-        std::fs::write(db_dir.join("ignore.txt"), "x").unwrap();
+        fs::create_dir_all(&db_dir).unwrap();
+        fs::write(db_dir.join("a.sql"), "-- dump").unwrap();
+        fs::write(db_dir.join("b.sql.gz"), "gz").unwrap();
+        fs::write(db_dir.join("c.bak"), "bak").unwrap();
+        fs::write(db_dir.join("ignore.txt"), "x").unwrap();
 
         let files = list_backups(&root, Some("mariadb"), Some("app_db")).unwrap();
         let names: Vec<_> = files
@@ -218,7 +423,7 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
 
-        assert_eq!(names, vec!["a.sql", "b.sql.gz"]);
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(names, vec!["a.sql", "b.sql.gz", "c.bak"]);
+        fs::remove_dir_all(root).unwrap();
     }
 }

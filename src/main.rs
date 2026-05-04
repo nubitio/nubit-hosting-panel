@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod doctor;
 mod export;
+mod mssql;
 mod store;
 mod tui;
 
@@ -314,8 +315,8 @@ fn main() -> Result<()> {
                 host,
                 port,
             } => {
-                if kind != "mariadb" && kind != "mysql" {
-                    bail!("por ahora solo kind=mariadb/mysql");
+                if kind != "mariadb" && kind != "mysql" && kind != "mssql" {
+                    bail!("kind no soportado: {}; usa mariadb, mysql o mssql", kind);
                 }
                 let server = store.add_db_server(&name, &kind, &host, port)?;
                 println!(

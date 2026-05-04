@@ -3,53 +3,26 @@ use mysql::{Opts, Pool, prelude::Queryable};
 
 use crate::{
     config::Config,
-    store::{DbServer, Store, validate_slug},
+    mssql,
+    store::{DbServer, ProvisionedDb, Store, convention_names, ensure_identifier},
 };
 
-pub struct ProvisionedDb {
-    pub database: String,
-    pub username: String,
-    pub host: String,
-    pub password: String,
-}
-
-pub fn convention_names(client: &str, app: &str, env: &str) -> Result<(String, String)> {
-    validate_slug(client)?;
-    validate_slug(app)?;
-    validate_slug(env)?;
-    Ok((
-        format!(
-            "{}_{}_{}",
-            client.replace('-', "_"),
-            app.replace('-', "_"),
-            env.replace('-', "_")
-        ),
-        format!(
-            "{}_{}_user",
-            client.replace('-', "_"),
-            app.replace('-', "_")
-        ),
-    ))
-}
+// ── Public dispatch ───────────────────────────────────────────────────────────
 
 pub fn check_connection(cfg: &Config, server: &DbServer) -> Result<()> {
-    ensure_mariadb(server)?;
-    let pool = pool(cfg, server)?;
-    let mut conn = pool.get_conn()?;
-    conn.query_drop("SELECT 1")?;
-    Ok(())
+    match server.kind.as_str() {
+        "mariadb" | "mysql" => mariadb_check_connection(cfg, server),
+        "mssql" => mssql::check_connection(cfg, server),
+        k => bail!("DB kind no soportado: {}", k),
+    }
 }
 
 pub fn create_database(cfg: &Config, server: &DbServer, name: &str) -> Result<()> {
-    ensure_mariadb(server)?;
-    ensure_identifier(name)?;
-    let pool = pool(cfg, server)?;
-    let mut conn = pool.get_conn()?;
-    conn.query_drop(format!(
-        "CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
-        name
-    ))?;
-    Ok(())
+    match server.kind.as_str() {
+        "mariadb" | "mysql" => mariadb_create_database(cfg, server, name),
+        "mssql" => mssql::create_database(cfg, server, name),
+        k => bail!("DB kind no soportado: {}", k),
+    }
 }
 
 pub fn create_user(
@@ -59,18 +32,11 @@ pub fn create_user(
     host: &str,
     password: &str,
 ) -> Result<()> {
-    ensure_mariadb(server)?;
-    ensure_identifier(username)?;
-    ensure_host(host)?;
-    let pool = pool(cfg, server)?;
-    let mut conn = pool.get_conn()?;
-    conn.query_drop(format!(
-        "CREATE USER IF NOT EXISTS '{}'@'{}' IDENTIFIED BY '{}'",
-        sql_string(username),
-        sql_string(host),
-        sql_string(password)
-    ))?;
-    Ok(())
+    match server.kind.as_str() {
+        "mariadb" | "mysql" => mariadb_create_user(cfg, server, username, host, password),
+        "mssql" => mssql::create_login(cfg, server, username, password),
+        k => bail!("DB kind no soportado: {}", k),
+    }
 }
 
 pub fn reset_password(
@@ -80,18 +46,11 @@ pub fn reset_password(
     host: &str,
     password: &str,
 ) -> Result<()> {
-    ensure_mariadb(server)?;
-    ensure_identifier(username)?;
-    ensure_host(host)?;
-    let pool = pool(cfg, server)?;
-    let mut conn = pool.get_conn()?;
-    conn.query_drop(format!(
-        "ALTER USER '{}'@'{}' IDENTIFIED BY '{}'",
-        sql_string(username),
-        sql_string(host),
-        sql_string(password)
-    ))?;
-    Ok(())
+    match server.kind.as_str() {
+        "mariadb" | "mysql" => mariadb_reset_password(cfg, server, username, host, password),
+        "mssql" => mssql::reset_password(cfg, server, username, password),
+        k => bail!("DB kind no soportado: {}", k),
+    }
 }
 
 pub fn grant_all(
@@ -105,11 +64,169 @@ pub fn grant_all(
     username: &str,
     host: &str,
 ) -> Result<()> {
-    ensure_mariadb(server)?;
+    match server.kind.as_str() {
+        "mariadb" | "mysql" => mariadb_grant_all(
+            cfg,
+            store,
+            server,
+            client_slug,
+            app_slug,
+            env,
+            db_name,
+            username,
+            host,
+        ),
+        "mssql" => mssql::grant_dbo(
+            cfg,
+            store,
+            server,
+            client_slug,
+            app_slug,
+            env,
+            db_name,
+            username,
+        ),
+        k => bail!("DB kind no soportado: {}", k),
+    }
+}
+
+pub fn provision(
+    cfg: &Config,
+    store: &Store,
+    server: &DbServer,
+    client: &str,
+    app: &str,
+    env: &str,
+    host: &str,
+    database: Option<&str>,
+    username: Option<&str>,
+    password: String,
+) -> Result<ProvisionedDb> {
+    let (default_db, default_user) = convention_names(client, app, env)?;
+    let database = database.unwrap_or(&default_db).to_string();
+    let username = username.unwrap_or(&default_user).to_string();
+
+    match server.kind.as_str() {
+        "mariadb" | "mysql" => {
+            mariadb_create_database(cfg, server, &database)?;
+            mariadb_create_user(cfg, server, &username, host, &password)?;
+            mariadb_grant_all(
+                cfg,
+                store,
+                server,
+                client,
+                Some(app),
+                env,
+                &database,
+                &username,
+                host,
+            )?;
+            Ok(ProvisionedDb {
+                database,
+                username,
+                host: host.to_string(),
+                password,
+            })
+        }
+        "mssql" => {
+            mssql::create_database(cfg, server, &database)?;
+            mssql::create_login(cfg, server, &username, &password)?;
+            mssql::grant_dbo(
+                cfg,
+                store,
+                server,
+                client,
+                Some(app),
+                env,
+                &database,
+                &username,
+            )?;
+            Ok(ProvisionedDb {
+                database,
+                username,
+                host: "server".to_string(),
+                password,
+            })
+        }
+        k => bail!("DB kind no soportado: {}", k),
+    }
+}
+
+// ── MariaDB internals ─────────────────────────────────────────────────────────
+
+fn mariadb_check_connection(cfg: &Config, server: &DbServer) -> Result<()> {
+    let pool = mariadb_pool(cfg, server)?;
+    let mut conn = pool.get_conn()?;
+    conn.query_drop("SELECT 1")?;
+    Ok(())
+}
+
+fn mariadb_create_database(cfg: &Config, server: &DbServer, name: &str) -> Result<()> {
+    ensure_identifier(name)?;
+    let pool = mariadb_pool(cfg, server)?;
+    let mut conn = pool.get_conn()?;
+    conn.query_drop(format!(
+        "CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+        name
+    ))?;
+    Ok(())
+}
+
+fn mariadb_create_user(
+    cfg: &Config,
+    server: &DbServer,
+    username: &str,
+    host: &str,
+    password: &str,
+) -> Result<()> {
+    ensure_identifier(username)?;
+    ensure_host(host)?;
+    let pool = mariadb_pool(cfg, server)?;
+    let mut conn = pool.get_conn()?;
+    conn.query_drop(format!(
+        "CREATE USER IF NOT EXISTS '{}'@'{}' IDENTIFIED BY '{}'",
+        sql_string(username),
+        sql_string(host),
+        sql_string(password)
+    ))?;
+    Ok(())
+}
+
+fn mariadb_reset_password(
+    cfg: &Config,
+    server: &DbServer,
+    username: &str,
+    host: &str,
+    password: &str,
+) -> Result<()> {
+    ensure_identifier(username)?;
+    ensure_host(host)?;
+    let pool = mariadb_pool(cfg, server)?;
+    let mut conn = pool.get_conn()?;
+    conn.query_drop(format!(
+        "ALTER USER '{}'@'{}' IDENTIFIED BY '{}'",
+        sql_string(username),
+        sql_string(host),
+        sql_string(password)
+    ))?;
+    Ok(())
+}
+
+fn mariadb_grant_all(
+    cfg: &Config,
+    store: &Store,
+    server: &DbServer,
+    client_slug: &str,
+    app_slug: Option<&str>,
+    env: &str,
+    db_name: &str,
+    username: &str,
+    host: &str,
+) -> Result<()> {
     ensure_identifier(db_name)?;
     ensure_identifier(username)?;
     ensure_host(host)?;
-    let pool = pool(cfg, server)?;
+    let pool = mariadb_pool(cfg, server)?;
     let mut conn = pool.get_conn()?;
     conn.query_drop(format!(
         "GRANT ALL PRIVILEGES ON `{}`.* TO '{}'@'{}'",
@@ -130,78 +247,18 @@ pub fn grant_all(
     Ok(())
 }
 
-pub fn provision(
-    cfg: &Config,
-    store: &Store,
-    server: &DbServer,
-    client: &str,
-    app: &str,
-    env: &str,
-    host: &str,
-    database: Option<&str>,
-    username: Option<&str>,
-    password: String,
-) -> Result<ProvisionedDb> {
-    let (default_db, default_user) = convention_names(client, app, env)?;
-    let database = database.unwrap_or(&default_db).to_string();
-    let username = username.unwrap_or(&default_user).to_string();
-
-    create_database(cfg, server, &database)?;
-    create_user(cfg, server, &username, host, &password)?;
-    grant_all(
-        cfg,
-        store,
-        server,
-        client,
-        Some(app),
-        env,
-        &database,
-        &username,
-        host,
-    )?;
-
-    Ok(ProvisionedDb {
-        database,
-        username,
-        host: host.to_string(),
-        password,
-    })
-}
-
-fn pool(cfg: &Config, server: &DbServer) -> Result<Pool> {
+fn mariadb_pool(cfg: &Config, server: &DbServer) -> Result<Pool> {
     let url = cfg.db_url(&server.name).ok_or_else(|| {
         eyre!(
-            "no hay credencial para DB server `{}`; define HOSTINGCTL_DB_{}_URL o [db_servers.{}].url en config.toml",
+            "no hay credencial para DB server `{}`; define HOSTINGCTL_DB_{}_URL",
             server.name,
             server.name.to_ascii_uppercase().replace('-', "_"),
-            server.name,
         )
     })?;
     Ok(Pool::new(Opts::from_url(&url)?)?)
 }
 
-fn ensure_mariadb(server: &DbServer) -> Result<()> {
-    if server.kind != "mariadb" && server.kind != "mysql" {
-        bail!(
-            "por ahora solo soportamos mariadb/mysql; recibido: {}",
-            server.kind
-        );
-    }
-    Ok(())
-}
-
-pub fn ensure_identifier(value: &str) -> Result<()> {
-    let ok = !value.is_empty()
-        && value.len() <= 64
-        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if !ok {
-        bail!(
-            "identificador inválido `{}`; usa solo letras, números y _",
-            value
-        );
-    }
-    Ok(())
-}
+// ── Common helpers ────────────────────────────────────────────────────────────
 
 fn ensure_host(value: &str) -> Result<()> {
     let ok = !value.is_empty()

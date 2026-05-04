@@ -10,6 +10,7 @@ pub struct Config {
     pub caddy_managed_path: PathBuf,
     pub caddy_validate_command: Option<String>,
     pub caddy_reload_command: Option<String>,
+    pub mssql_sqlcmd_path: String,
     #[serde(default)]
     pub db_servers: HashMap<String, DbServerSecret>,
 }
@@ -54,6 +55,7 @@ impl Config {
             caddy_reload_command: Some(
                 "docker exec caddy caddy reload --config /etc/caddy/Caddyfile".to_string(),
             ),
+            mssql_sqlcmd_path: "/opt/mssql-tools18/bin/sqlcmd".to_string(),
             db_servers: HashMap::new(),
         })
     }

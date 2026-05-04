@@ -393,6 +393,45 @@ pub fn validate_slug(value: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_identifier(value: &str) -> Result<()> {
+    let ok = !value.is_empty()
+        && value.len() <= 64
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ok {
+        bail!(
+            "identificador inválido `{}`; usa solo letras, números y _",
+            value
+        );
+    }
+    Ok(())
+}
+
+pub struct ProvisionedDb {
+    pub database: String,
+    pub username: String,
+    pub host: String,
+    pub password: String,
+}
+
+pub fn convention_names(client: &str, app: &str, env: &str) -> Result<(String, String)> {
+    validate_slug(client)?;
+    validate_slug(app)?;
+    validate_slug(env)?;
+    Ok((
+        format!(
+            "{}_{}_{}",
+            client.replace('-', "_"),
+            app.replace('-', "_"),
+            env.replace('-', "_")
+        ),
+        format!(
+            "{}_{}_user",
+            client.replace('-', "_"),
+            app.replace('-', "_")
+        ),
+    ))
+}
+
 fn parse_dt(raw: String) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&raw)
         .map(|dt| dt.with_timezone(&Utc))
