@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::{self, File},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -57,15 +57,11 @@ pub fn backup(cfg: &Config, server: &DbServer, database: &str, out_dir: &Path) -
 }
 
 pub fn restore(cfg: &Config, server: &DbServer, database: &str, dump_path: &Path) -> Result<()> {
+    validate_restore_input(dump_path)?;
     db::ensure_identifier(database)?;
     let creds = creds(cfg, server)?;
 
-    let input: Box<dyn std::io::Read> =
-        if dump_path.extension().and_then(|s| s.to_str()) == Some("gz") {
-            Box::new(GzDecoder::new(File::open(dump_path)?))
-        } else {
-            Box::new(File::open(dump_path)?)
-        };
+    let input = open_dump(dump_path)?;
 
     let mut cmd = docker_exec_base(server, creds.password.as_deref());
     cmd.arg("mariadb")
@@ -92,6 +88,88 @@ pub fn restore(cfg: &Config, server: &DbServer, database: &str, dump_path: &Path
             database,
             dump_path.display()
         );
+    }
+    Ok(())
+}
+
+pub fn dry_run_restore(
+    cfg: &Config,
+    server: &DbServer,
+    database: &str,
+    dump_path: &Path,
+) -> Result<()> {
+    validate_restore_input(dump_path)?;
+    db::ensure_identifier(database)?;
+    let _ = creds(cfg, server)?;
+    let mut reader = std::io::BufReader::new(open_dump(dump_path)?);
+    let mut sink = std::io::sink();
+    std::io::copy(&mut reader, &mut sink).wrap_err("leyendo dump completo")?;
+    Ok(())
+}
+
+pub fn list_backups(
+    out_dir: &Path,
+    server: Option<&str>,
+    database: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let root = match (server, database) {
+        (Some(server), Some(database)) => out_dir.join(server).join(database),
+        (Some(server), None) => out_dir.join(server),
+        (None, _) => out_dir.to_path_buf(),
+    };
+
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    collect_dumps(&root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn validate_restore_input(dump_path: &Path) -> Result<()> {
+    if !dump_path.exists() {
+        bail!("dump no existe: {}", dump_path.display());
+    }
+    if !dump_path.is_file() {
+        bail!("dump no es archivo: {}", dump_path.display());
+    }
+    let name = dump_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if !(name.ends_with(".sql") || name.ends_with(".sql.gz")) {
+        bail!(
+            "dump debe terminar en .sql o .sql.gz: {}",
+            dump_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn open_dump(dump_path: &Path) -> Result<Box<dyn std::io::Read>> {
+    if dump_path.extension().and_then(|s| s.to_str()) == Some("gz") {
+        Ok(Box::new(GzDecoder::new(File::open(dump_path)?)))
+    } else {
+        Ok(Box::new(File::open(dump_path)?))
+    }
+}
+
+fn collect_dumps(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dumps(&path, files)?;
+        } else if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| name.ends_with(".sql") || name.ends_with(".sql.gz"))
+            .unwrap_or(false)
+        {
+            files.push(path);
+        }
     }
     Ok(())
 }

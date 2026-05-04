@@ -167,6 +167,18 @@ enum DbSubcommand {
         server: String,
         database: String,
         dump: PathBuf,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    BackupList {
+        #[arg(long, default_value = "./backups")]
+        out: PathBuf,
+        #[arg(long)]
+        server: Option<String>,
+        #[arg(long)]
+        database: Option<String>,
     },
 }
 
@@ -355,10 +367,30 @@ fn main() -> Result<()> {
                 server,
                 database,
                 dump,
+                yes,
+                dry_run,
             } => {
                 let server = store.db_server(&server)?;
-                backup::restore(&cfg, &server, &database, &dump)?;
-                println!("restore aplicado: {} <- {}", database, dump.display());
+                if dry_run {
+                    backup::dry_run_restore(&cfg, &server, &database, &dump)?;
+                    println!("dry-run OK: {} <- {}", database, dump.display());
+                } else {
+                    if !yes {
+                        bail!("restore requiere --yes; usa --dry-run para validar sin aplicar");
+                    }
+                    backup::restore(&cfg, &server, &database, &dump)?;
+                    println!("restore aplicado: {} <- {}", database, dump.display());
+                }
+            }
+            DbSubcommand::BackupList {
+                out,
+                server,
+                database,
+            } => {
+                let files = backup::list_backups(&out, server.as_deref(), database.as_deref())?;
+                for file in files {
+                    println!("{}", file.display());
+                }
             }
         },
     }

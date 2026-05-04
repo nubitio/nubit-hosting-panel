@@ -132,7 +132,9 @@ Backup/restore local usando `docker exec <server>` y `mariadb-dump`/`mariadb` de
 
 ```sh
 hostingctl db backup mariadb porteroseguro_web_prod --out ./backups
-hostingctl db restore mariadb porteroseguro_web_prod ./backups/mariadb/porteroseguro_web_prod/20260504-153000.sql.gz
+hostingctl db backup-list --out ./backups --server mariadb --database porteroseguro_web_prod
+hostingctl db restore mariadb porteroseguro_web_prod ./backups/mariadb/porteroseguro_web_prod/20260504-153000.sql.gz --dry-run
+hostingctl db restore mariadb porteroseguro_web_prod ./backups/mariadb/porteroseguro_web_prod/20260504-153000.sql.gz --yes
 ```
 
 El backup genera `.sql.gz` en:
