@@ -10,6 +10,7 @@ pub struct Config {
     pub caddy_managed_path: PathBuf,
     pub caddy_validate_command: Option<String>,
     pub caddy_reload_command: Option<String>,
+    #[serde(default = "default_sqlcmd_path")]
     pub mssql_sqlcmd_path: String,
     #[serde(default)]
     pub db_servers: HashMap<String, DbServerSecret>,
@@ -79,6 +80,10 @@ impl Config {
             .ok()
             .or_else(|| self.db_servers.get(server_name).map(|s| s.url.clone()))
     }
+}
+
+fn default_sqlcmd_path() -> String {
+    "/opt/mssql-tools18/bin/sqlcmd".to_string()
 }
 
 fn env_key(value: &str) -> String {
