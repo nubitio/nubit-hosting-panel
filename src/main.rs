@@ -2,6 +2,7 @@ mod backup;
 mod caddy;
 mod config;
 mod db;
+mod export;
 mod store;
 mod tui;
 
@@ -34,6 +35,19 @@ enum Command {
     Caddy(CaddyCommand),
     /// Gestionar servidores DB, bases, usuarios y grants
     Db(DbCommand),
+    /// Exportar metadata del panel en JSON
+    Export {
+        #[arg(long, default_value = "hostingctl-export.json")]
+        out: PathBuf,
+    },
+    /// Importar metadata del panel desde JSON
+    Import {
+        path: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Args)]
@@ -245,6 +259,40 @@ fn main() -> Result<()> {
                 );
             }
         },
+        Command::Export { out } => {
+            let exported = export::write(&store, &out)?;
+            println!(
+                "export creado: {} (clients={}, apps={}, db_servers={}, grants={})",
+                out.display(),
+                exported.clients.len(),
+                exported.apps.len(),
+                exported.db_servers.len(),
+                exported.database_grants.len()
+            );
+        }
+        Command::Import { path, dry_run, yes } => {
+            let imported = export::read(&path)?;
+            if dry_run {
+                println!(
+                    "dry-run OK: {} (version={}, clients={}, apps={}, db_servers={}, grants={})",
+                    path.display(),
+                    imported.version,
+                    imported.clients.len(),
+                    imported.apps.len(),
+                    imported.db_servers.len(),
+                    imported.database_grants.len()
+                );
+            } else {
+                if !yes {
+                    bail!("import requiere --yes; usa --dry-run para validar sin aplicar");
+                }
+                let summary = export::import(&store, &imported)?;
+                println!(
+                    "import aplicado: clients={}, apps={}, db_servers={}, grants={}",
+                    summary.clients, summary.apps, summary.db_servers, summary.database_grants
+                );
+            }
+        }
         Command::Db(cmd) => match cmd.command {
             DbSubcommand::ServerAdd {
                 name,

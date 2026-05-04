@@ -10,6 +10,7 @@
 - Slugs estrictos: `a-z`, `0-9`, `-`, `_`.
 - Registro/listado de clientes.
 - Registro/listado de sitios/apps/dominios por cliente.
+- Export/import JSON de metadata del panel sin secretos.
 - Caddy en archivo gestionado separado: `hostingctl.caddy`.
 - `caddy bootstrap` para agregar `import hostingctl.caddy` al Caddyfile principal.
 - `caddy apply` con backup y validación antes de reload.
@@ -141,6 +142,29 @@ El backup genera `.sql.gz` en:
 
 ```txt
 ./backups/{server}/{database}/{timestamp}.sql.gz
+```
+
+## Export/import metadata
+
+Exporta clientes, apps, DB servers metadata y grants. No exporta passwords.
+
+```sh
+hostingctl export --out hostingctl-export.json
+hostingctl import hostingctl-export.json --dry-run
+hostingctl import hostingctl-export.json --yes
+```
+
+Formato público versionado en JSON:
+
+```json
+{
+  "version": 1,
+  "exported_at": "...",
+  "clients": [],
+  "apps": [],
+  "db_servers": [],
+  "database_grants": []
+}
 ```
 
 ## Release

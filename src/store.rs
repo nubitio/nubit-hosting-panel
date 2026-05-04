@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Result, bail};
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Client {
     pub id: String,
     pub slug: String,
@@ -12,7 +13,7 @@ pub struct Client {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct App {
     pub id: String,
     pub client_slug: String,
@@ -22,13 +23,26 @@ pub struct App {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbServer {
     pub id: String,
     pub name: String,
     pub kind: String,
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseGrant {
+    pub id: String,
+    pub server_name: String,
+    pub client_slug: String,
+    pub app_slug: Option<String>,
+    pub env: String,
+    pub db_name: String,
+    pub username: String,
+    pub host: String,
+    pub created_at: DateTime<Utc>,
 }
 
 pub struct Store {
@@ -237,6 +251,73 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_database_grants(&self) -> Result<Vec<DatabaseGrant>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, s.name, c.slug, a.slug, g.env, g.db_name, g.username, g.host, g.created_at
+             FROM database_grants g
+             JOIN db_servers s ON s.id = g.server_id
+             JOIN clients c ON c.id = g.client_id
+             LEFT JOIN apps a ON a.id = g.app_id
+             ORDER BY s.name, c.slug, a.slug, g.env, g.db_name, g.username",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DatabaseGrant {
+                id: row.get(0)?,
+                server_name: row.get(1)?,
+                client_slug: row.get(2)?,
+                app_slug: row.get(3)?,
+                env: row.get(4)?,
+                db_name: row.get(5)?,
+                username: row.get(6)?,
+                host: row.get(7)?,
+                created_at: parse_dt(row.get::<_, String>(8)?)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn import_client(&self, client: &Client) -> Result<()> {
+        validate_slug(&client.slug)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO clients (id, slug, name, email, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![client.id, client.slug, client.name, client.email, client.created_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn import_app(&self, app: &App) -> Result<()> {
+        validate_slug(&app.client_slug)?;
+        validate_slug(&app.slug)?;
+        let client_id = self.client_id(&app.client_slug)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO apps (id, client_id, slug, domain, upstream, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![app.id, client_id, app.slug, app.domain, app.upstream, app.created_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn import_db_server(&self, server: &DbServer) -> Result<()> {
+        validate_slug(&server.name)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO db_servers (id, name, kind, host, port, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![server.id, server.name, server.kind, server.host, server.port, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn import_database_grant(&self, grant: &DatabaseGrant) -> Result<()> {
+        let server = self.db_server(&grant.server_name)?;
+        self.record_grant(
+            &server.id,
+            &grant.client_slug,
+            grant.app_slug.as_deref(),
+            &grant.env,
+            &grant.db_name,
+            &grant.username,
+            &grant.host,
+        )
     }
 
     pub fn record_grant(
