@@ -32,6 +32,14 @@ pub fn convention_names(client: &str, app: &str, env: &str) -> Result<(String, S
     ))
 }
 
+pub fn check_connection(cfg: &Config, server: &DbServer) -> Result<()> {
+    ensure_mariadb(server)?;
+    let pool = pool(cfg, server)?;
+    let mut conn = pool.get_conn()?;
+    conn.query_drop("SELECT 1")?;
+    Ok(())
+}
+
 pub fn create_database(cfg: &Config, server: &DbServer, name: &str) -> Result<()> {
     ensure_mariadb(server)?;
     ensure_identifier(name)?;

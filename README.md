@@ -17,6 +17,7 @@
 - DB servers sin secretos en SQLite.
 - Credenciales DB por env var o `config.toml`; env var tiene prioridad.
 - MariaDB/MySQL: crear databases, crear usuarios, grants, provision, reset password, backup y restore local.
+- `status` y `doctor` para diagnóstico del VPS.
 - CI con `cargo fmt --check`, `cargo clippy` y `cargo test`.
 - GitHub Actions release Linux-only con artefactos `.tar.gz`, checksums e `install.sh`.
 
@@ -31,6 +32,15 @@ cargo run -- app add porteroseguro web \
 cargo run -- caddy render
 cargo run -- tui
 ```
+
+## Status/doctor
+
+```sh
+hostingctl status
+hostingctl doctor
+```
+
+`doctor` valida Docker, contenedores, Caddyfile/import, credenciales DB y conexión MariaDB.
 
 ## Caddy
 

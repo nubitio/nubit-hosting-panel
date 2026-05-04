@@ -2,6 +2,7 @@ mod backup;
 mod caddy;
 mod config;
 mod db;
+mod doctor;
 mod export;
 mod store;
 mod tui;
@@ -27,6 +28,10 @@ enum Command {
     Init,
     /// Abre TUI básica
     Tui,
+    /// Muestra resumen de estado local
+    Status,
+    /// Diagnostica dependencias, Caddy, Docker y DBs
+    Doctor,
     /// Gestionar clientes
     Client(ClientCommand),
     /// Gestionar sitios/apps
@@ -211,6 +216,15 @@ fn main() -> Result<()> {
             println!("managed:{}", cfg.caddy_managed_path.display());
         }
         Command::Tui => tui::run(&store)?,
+        Command::Status => print_status(&cfg, &store)?,
+        Command::Doctor => {
+            let checks = doctor::run(&cfg, &store)?;
+            let failed = checks.iter().any(|check| !check.ok);
+            doctor::print(&checks);
+            if failed {
+                std::process::exit(1);
+            }
+        }
         Command::Client(cmd) => match cmd.command {
             ClientSubcommand::Add { slug, name, email } => {
                 let client = store.add_client(&slug, &name, email.as_deref())?;
@@ -443,6 +457,21 @@ fn main() -> Result<()> {
         },
     }
 
+    Ok(())
+}
+
+fn print_status(cfg: &Config, store: &Store) -> Result<()> {
+    println!("Nubit Hosting Panel status");
+    println!("config:  {}", Config::default_path()?.display());
+    println!("data:    {}", cfg.data_dir.display());
+    println!("sqlite:  {}", cfg.db_path().display());
+    println!("caddy:   {}", cfg.caddyfile_path.display());
+    println!("managed: {}", cfg.caddy_managed_path.display());
+    println!();
+    println!("clients:    {}", store.list_clients()?.len());
+    println!("apps:       {}", store.list_apps()?.len());
+    println!("db servers: {}", store.list_db_servers()?.len());
+    println!("db grants:  {}", store.list_database_grants()?.len());
     Ok(())
 }
 
