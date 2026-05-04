@@ -15,7 +15,7 @@
 - `caddy apply` con backup y validación antes de reload.
 - DB servers sin secretos en SQLite.
 - Credenciales DB por env var o `config.toml`; env var tiene prioridad.
-- MariaDB/MySQL: crear databases, crear usuarios, grants, provision y reset password.
+- MariaDB/MySQL: crear databases, crear usuarios, grants, provision, reset password, backup y restore local.
 - GitHub Actions release Linux-only con artefactos `.tar.gz`, checksums e `install.sh`.
 
 ## Uso local
@@ -126,6 +126,19 @@ Comandos bajos disponibles:
 hostingctl db create-database mariadb porteroseguro porteroseguro_web_prod
 hostingctl db create-user mariadb porteroseguro_web_user --generate --host '%'
 hostingctl db grant mariadb porteroseguro porteroseguro_web_prod porteroseguro_web_user --host '%'
+```
+
+Backup/restore local usando `docker exec <server>` y `mariadb-dump`/`mariadb` dentro del contenedor:
+
+```sh
+hostingctl db backup mariadb porteroseguro_web_prod --out ./backups
+hostingctl db restore mariadb porteroseguro_web_prod ./backups/mariadb/porteroseguro_web_prod/20260504-153000.sql.gz
+```
+
+El backup genera `.sql.gz` en:
+
+```txt
+./backups/{server}/{database}/{timestamp}.sql.gz
 ```
 
 ## Release

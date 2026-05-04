@@ -1180,12 +1180,14 @@ dependencies = [
  "color-eyre",
  "crossterm 0.29.0",
  "dirs",
+ "flate2",
  "mysql",
  "rand",
  "ratatui",
  "rusqlite",
  "serde",
  "toml",
+ "url",
  "uuid",
 ]
 

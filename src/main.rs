@@ -1,8 +1,11 @@
+mod backup;
 mod caddy;
 mod config;
 mod db;
 mod store;
 mod tui;
+
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre::{Result, bail};
@@ -153,6 +156,17 @@ enum DbSubcommand {
         password: Option<String>,
         #[arg(long)]
         generate: bool,
+    },
+    Backup {
+        server: String,
+        database: String,
+        #[arg(long, default_value = "./backups")]
+        out: PathBuf,
+    },
+    Restore {
+        server: String,
+        database: String,
+        dump: PathBuf,
     },
 }
 
@@ -327,6 +341,24 @@ fn main() -> Result<()> {
                 db::reset_password(&cfg, &server, &username, &host, &password)?;
                 println!("password actualizado: '{}'@'{}'", username, host);
                 print_secret(&password);
+            }
+            DbSubcommand::Backup {
+                server,
+                database,
+                out,
+            } => {
+                let server = store.db_server(&server)?;
+                let path = backup::backup(&cfg, &server, &database, &out)?;
+                println!("backup creado: {}", path.display());
+            }
+            DbSubcommand::Restore {
+                server,
+                database,
+                dump,
+            } => {
+                let server = store.db_server(&server)?;
+                backup::restore(&cfg, &server, &database, &dump)?;
+                println!("restore aplicado: {} <- {}", database, dump.display());
             }
         },
     }

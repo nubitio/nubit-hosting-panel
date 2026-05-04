@@ -182,7 +182,7 @@ fn ensure_mariadb(server: &DbServer) -> Result<()> {
     Ok(())
 }
 
-fn ensure_identifier(value: &str) -> Result<()> {
+pub fn ensure_identifier(value: &str) -> Result<()> {
     let ok = !value.is_empty()
         && value.len() <= 64
         && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
