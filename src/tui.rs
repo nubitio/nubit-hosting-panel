@@ -22,6 +22,96 @@ use crate::{
     store::{App as HostingApp, Client, DatabaseGrant, DbServer, Store},
 };
 
+// ── System info ──────────────────────────────────────────────────────────────
+
+#[derive(Default, Clone)]
+struct SysInfo {
+    hostname: String,
+    primary_ip: String,
+    cpu_usage_pct: f32,
+    ram_used: u64,
+    ram_total: u64,
+    disk_used: u64,
+    disk_total: u64,
+    load_avg: String,
+}
+
+fn load_sys_info() -> SysInfo {
+    use sysinfo::{Disks, System};
+
+    let mut sys = System::new();
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+
+    let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
+    let cpu_usage = sys.global_cpu_usage();
+    let ram_used = sys.used_memory();
+    let ram_total = sys.total_memory();
+
+    let disks = Disks::new_with_refreshed_list();
+    let (disk_used, disk_total) = disks
+        .iter()
+        .find(|d| d.mount_point() == std::path::Path::new("/"))
+        .map(|d| (d.total_space() - d.available_space(), d.total_space()))
+        .unwrap_or((0, 0));
+
+    let load = System::load_average();
+    let load_avg = format!("{:.2} {:.2} {:.2}", load.one, load.five, load.fifteen);
+
+    let primary_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|s| {
+            s.connect("8.8.8.8:80").ok()?;
+            s.local_addr().ok()
+        })
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    SysInfo {
+        hostname,
+        primary_ip,
+        cpu_usage_pct: cpu_usage,
+        ram_used,
+        ram_total,
+        disk_used,
+        disk_total,
+        load_avg,
+    }
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+fn pct_bar(used: u64, total: u64, width: usize) -> (String, Color) {
+    let pct = if total == 0 {
+        0.0
+    } else {
+        used as f64 / total as f64 * 100.0
+    };
+    let filled = (pct / 100.0 * width as f64).round() as usize;
+    let bar = format!(
+        "[{}{}] {:.0}%",
+        "█".repeat(filled.min(width)),
+        "░".repeat(width.saturating_sub(filled)),
+        pct,
+    );
+    let color = if pct >= 90.0 {
+        Color::Red
+    } else if pct >= 75.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    (bar, color)
+}
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -196,6 +286,7 @@ struct TuiState {
     backups: Vec<BackupEntry>,
     doctor_checks: Vec<doctor::Check>,
     doctor_loaded: bool,
+    sys_info: SysInfo,
     clients_table: TableState,
     apps_table: TableState,
     db_table: TableState,
@@ -216,6 +307,7 @@ impl TuiState {
             backups: scan_backups(&cfg.backup_dir),
             doctor_checks,
             doctor_loaded: true,
+            sys_info: load_sys_info(),
             clients_table: TableState::default(),
             apps_table: TableState::default(),
             db_table: TableState::default(),
@@ -233,6 +325,7 @@ impl TuiState {
         self.backups = scan_backups(&cfg.backup_dir);
         self.doctor_checks = doctor::run(cfg, store).unwrap_or_default();
         self.doctor_loaded = true;
+        self.sys_info = load_sys_info();
         Ok(())
     }
 
@@ -769,8 +862,59 @@ fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(area);
 
-    // Left: summary
-    let summary: Vec<Line> = vec![
+    // ── Left: system info + panel summary ────────────────────────────────────
+    let si = &state.sys_info;
+    let (cpu_bar, cpu_color) = pct_bar(si.cpu_usage_pct as u64, 100, 14);
+    let (ram_bar, ram_color) = pct_bar(si.ram_used, si.ram_total, 14);
+    let (disk_bar, disk_color) = pct_bar(si.disk_used, si.disk_total, 14);
+
+    let mut left_lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Host:  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                si.hostname.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  IP:    ", Style::default().fg(Color::Gray)),
+            Span::styled(si.primary_ip.clone(), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Load:  ", Style::default().fg(Color::Gray)),
+            Span::styled(si.load_avg.clone(), Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  CPU:   ", Style::default().fg(Color::Gray)),
+            Span::styled(cpu_bar, Style::default().fg(cpu_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("  RAM:   ", Style::default().fg(Color::Gray)),
+            Span::styled(ram_bar, Style::default().fg(ram_color)),
+            Span::styled(
+                format!(" {}/{}", fmt_bytes(si.ram_used), fmt_bytes(si.ram_total)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Disk:  ", Style::default().fg(Color::Gray)),
+            Span::styled(disk_bar, Style::default().fg(disk_color)),
+            Span::styled(
+                format!(" {}/{}", fmt_bytes(si.disk_used), fmt_bytes(si.disk_total)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Panel:",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::from(""),
         Line::from(vec![
             Span::styled("  Clients:    ", Style::default().fg(Color::Gray)),
@@ -808,30 +952,24 @@ fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  DB Servers:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-    ]
-    .into_iter()
-    .chain(
-        state
-            .db_servers
-            .iter()
-            .map(|s| Line::from(format!("    {} ({}) {}:{}", s.name, s.kind, s.host, s.port))),
-    )
-    .collect();
+    ];
+
+    if !state.db_servers.is_empty() {
+        left_lines.push(Line::from(""));
+        for s in &state.db_servers {
+            left_lines.push(Line::from(format!(
+                "    {} ({}) {}:{}",
+                s.name, s.kind, s.host, s.port
+            )));
+        }
+    }
 
     frame.render_widget(
-        Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(" Summary ")),
+        Paragraph::new(left_lines).block(Block::default().borders(Borders::ALL).title(" Sistema ")),
         chunks[0],
     );
 
-    // Right: doctor checks
+    // ── Right: doctor checks ──────────────────────────────────────────────────
     let doctor_lines: Vec<Line> = if !state.doctor_loaded {
         vec![Line::from("  Ejecutando checks...")]
     } else {
