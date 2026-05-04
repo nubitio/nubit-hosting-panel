@@ -41,6 +41,12 @@ jobs:
         if: matrix.use_cross == true
         run: cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+          echo "Building version $VERSION"
+
       - name: Build (native)
         if: matrix.use_cross != true
         run: cargo build --release --target ${{ matrix.target }}
