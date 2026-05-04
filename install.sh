@@ -6,6 +6,15 @@ set -e
 REPO="${HOSTINGCTL_REPO:-nubitio/nubit-hosting-panel}"
 BINARY="hostingctl"
 PREFIX=""
+TOKEN="${HOSTINGCTL_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+
+curl_auth() {
+  if [ -n "${TOKEN}" ]; then
+    curl -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" "$@"
+  else
+    curl "$@"
+  fi
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -39,7 +48,7 @@ if [ -n "${HOSTINGCTL_VERSION:-}" ]; then
   VERSION="${HOSTINGCTL_VERSION}"
 else
   echo "Fetching latest release…"
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+  VERSION="$(curl_auth -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
     | grep '"tag_name"' \
     | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
 fi
@@ -55,10 +64,10 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR}"' EXIT
 
 echo "Downloading hostingctl ${VERSION} for ${TARGET}…"
-curl -fsSL "${URL}" -o "${TMPDIR}/${ARCHIVE}"
+curl_auth -fsSL "${URL}" -o "${TMPDIR}/${ARCHIVE}"
 
 echo "Verifying checksum…"
-curl -fsSL "${URL}.sha256" -o "${TMPDIR}/${ARCHIVE}.sha256"
+curl_auth -fsSL "${URL}.sha256" -o "${TMPDIR}/${ARCHIVE}.sha256"
 (cd "${TMPDIR}" && sha256sum -c "${ARCHIVE}.sha256")
 
 echo "Installing to ${BIN_DIR}…"

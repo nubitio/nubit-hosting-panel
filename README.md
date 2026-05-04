@@ -148,3 +148,13 @@ Por defecto instala en `/usr/local/bin`; puedes usar `--prefix`:
 ```sh
 curl -fsSL https://github.com/nubitio/nubit-hosting-panel/releases/latest/download/install.sh | sh -s -- --prefix ~/.local
 ```
+
+Si el repo/release es privado, usa un token con permiso de lectura:
+
+```sh
+export GITHUB_TOKEN='ghp_xxx'
+curl -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+  -fsSL https://github.com/nubitio/nubit-hosting-panel/releases/latest/download/install.sh | sh
+```
+
+El installer también usa `GITHUB_TOKEN`/`HOSTINGCTL_GITHUB_TOKEN` para descargar binario y checksum.
