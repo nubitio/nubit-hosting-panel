@@ -1,4 +1,4 @@
-use std::io;
+use std::{fs, io, path::PathBuf};
 
 use color_eyre::eyre::Result;
 use crossterm::{
@@ -15,9 +15,14 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs},
 };
 
-use crate::store::{App as HostingApp, Client, DatabaseGrant, DbServer, Store};
+use crate::{
+    backup,
+    config::Config,
+    db, doctor,
+    store::{App as HostingApp, Client, DatabaseGrant, DbServer, Store},
+};
 
-// ── Tab ───────────────────────────────────────────────────────────────────────
+// ── Tabs ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
@@ -25,6 +30,7 @@ enum ActiveTab {
     Clients,
     Apps,
     Databases,
+    Backups,
 }
 
 impl ActiveTab {
@@ -34,6 +40,7 @@ impl ActiveTab {
             Self::Clients => 1,
             Self::Apps => 2,
             Self::Databases => 3,
+            Self::Backups => 4,
         }
     }
     fn from_index(i: usize) -> Self {
@@ -41,18 +48,19 @@ impl ActiveTab {
             1 => Self::Clients,
             2 => Self::Apps,
             3 => Self::Databases,
+            4 => Self::Backups,
             _ => Self::Dashboard,
         }
     }
     fn next(self) -> Self {
-        Self::from_index((self.index() + 1) % 4)
+        Self::from_index((self.index() + 1) % 5)
     }
     fn prev(self) -> Self {
-        Self::from_index((self.index() + 3) % 4)
+        Self::from_index((self.index() + 4) % 5)
     }
 }
 
-// ── Input / Form ──────────────────────────────────────────────────────────────
+// ── Form / Modal ──────────────────────────────────────────────────────────────
 
 #[derive(Default, Clone)]
 struct Input {
@@ -102,6 +110,8 @@ impl FormField {
 enum FormKind {
     AddClient,
     AddApp,
+    Provision,
+    Backup,
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +134,55 @@ enum Modal {
         kind: ConfirmKind,
         id: String,
     },
+    Result {
+        title: String,
+        lines: Vec<String>,
+    },
+}
+
+// ── Backup entry ──────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct BackupEntry {
+    server: String,
+    database: String,
+    filename: String,
+    size_bytes: u64,
+    path: PathBuf,
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn scan_backups(backup_dir: &std::path::Path) -> Vec<BackupEntry> {
+    backup::list_backups(backup_dir, None, None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| {
+            let meta = fs::metadata(&path).ok()?;
+            let filename = path.file_name()?.to_str()?.to_string();
+            let rel = path.strip_prefix(backup_dir).ok()?;
+            let mut parts = rel.components();
+            let server = parts.next()?.as_os_str().to_str()?.to_string();
+            let database = parts.next()?.as_os_str().to_str()?.to_string();
+            Some(BackupEntry {
+                server,
+                database,
+                filename,
+                size_bytes: meta.len(),
+                path,
+            })
+        })
+        .collect()
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -134,34 +193,46 @@ struct TuiState {
     apps: Vec<HostingApp>,
     db_servers: Vec<DbServer>,
     grants: Vec<DatabaseGrant>,
+    backups: Vec<BackupEntry>,
+    doctor_checks: Vec<doctor::Check>,
+    doctor_loaded: bool,
     clients_table: TableState,
     apps_table: TableState,
     db_table: TableState,
+    backups_table: TableState,
     status: String,
     modal: Modal,
 }
 
 impl TuiState {
-    fn load(store: &Store) -> Result<Self> {
+    fn load(store: &Store, cfg: &Config) -> Result<Self> {
+        let doctor_checks = doctor::run(cfg, store).unwrap_or_default();
         Ok(Self {
             tab: ActiveTab::Dashboard,
             clients: store.list_clients()?,
             apps: store.list_apps()?,
             db_servers: store.list_db_servers()?,
             grants: store.list_database_grants()?,
+            backups: scan_backups(&cfg.backup_dir),
+            doctor_checks,
+            doctor_loaded: true,
             clients_table: TableState::default(),
             apps_table: TableState::default(),
             db_table: TableState::default(),
+            backups_table: TableState::default(),
             status: String::new(),
             modal: Modal::None,
         })
     }
 
-    fn reload(&mut self, store: &Store) -> Result<()> {
+    fn reload(&mut self, store: &Store, cfg: &Config) -> Result<()> {
         self.clients = store.list_clients()?;
         self.apps = store.list_apps()?;
         self.db_servers = store.list_db_servers()?;
         self.grants = store.list_database_grants()?;
+        self.backups = scan_backups(&cfg.backup_dir);
+        self.doctor_checks = doctor::run(cfg, store).unwrap_or_default();
+        self.doctor_loaded = true;
         Ok(())
     }
 
@@ -175,6 +246,7 @@ impl TuiState {
             ActiveTab::Clients => nav_down(&mut self.clients_table, self.clients.len()),
             ActiveTab::Apps => nav_down(&mut self.apps_table, self.apps.len()),
             ActiveTab::Databases => nav_down(&mut self.db_table, self.db_servers.len()),
+            ActiveTab::Backups => nav_down(&mut self.backups_table, self.backups.len()),
             ActiveTab::Dashboard => {}
         }
     }
@@ -184,6 +256,7 @@ impl TuiState {
             ActiveTab::Clients => nav_up(&mut self.clients_table, self.clients.len()),
             ActiveTab::Apps => nav_up(&mut self.apps_table, self.apps.len()),
             ActiveTab::Databases => nav_up(&mut self.db_table, self.db_servers.len()),
+            ActiveTab::Backups => nav_up(&mut self.backups_table, self.backups.len()),
             ActiveTab::Dashboard => {}
         }
     }
@@ -216,10 +289,49 @@ impl TuiState {
                         FormField::req("Cliente (slug)", "ej: acme-corp").prefill(prefill),
                         FormField::req("App slug", "ej: web"),
                         FormField::req("Dominio", "ej: acme.nubit.site"),
-                        FormField::req("Upstream", "ej: container_name:8080"),
+                        FormField::req("Upstream", "ej: container:8080"),
                     ],
                     focus: 0,
                     kind: FormKind::AddApp,
+                    error: None,
+                };
+            }
+            ActiveTab::Databases => {
+                let prefill = self
+                    .db_table
+                    .selected()
+                    .and_then(|i| self.db_servers.get(i))
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("");
+                self.modal = Modal::Form {
+                    title: " Provisionar DB ",
+                    fields: vec![
+                        FormField::req("DB Server", "ej: mariadb").prefill(prefill),
+                        FormField::req("Cliente (slug)", "ej: acme-corp"),
+                        FormField::req("App (slug)", "ej: web"),
+                        FormField::req("Env", "prod").prefill("prod"),
+                        FormField::opt("Password", "vacío = auto-generar"),
+                    ],
+                    focus: 0,
+                    kind: FormKind::Provision,
+                    error: None,
+                };
+            }
+            ActiveTab::Backups => {
+                let server_prefill = self
+                    .backups_table
+                    .selected()
+                    .and_then(|i| self.backups.get(i))
+                    .map(|b| b.server.as_str())
+                    .unwrap_or("");
+                self.modal = Modal::Form {
+                    title: " Nuevo Backup ",
+                    fields: vec![
+                        FormField::req("DB Server", "ej: mariadb").prefill(server_prefill),
+                        FormField::req("Database", "ej: acme_web_prod"),
+                    ],
+                    focus: 0,
+                    kind: FormKind::Backup,
                     error: None,
                 };
             }
@@ -280,7 +392,7 @@ fn nav_up(state: &mut TableState, len: usize) {
 
 // ── Event handling ────────────────────────────────────────────────────────────
 
-fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store) -> Result<()> {
+fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Config) -> Result<()> {
     match code {
         KeyCode::Tab => state.switch_tab(state.tab.next()),
         KeyCode::BackTab => state.switch_tab(state.tab.prev()),
@@ -288,16 +400,21 @@ fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store) -> Result
         KeyCode::Char('2') => state.switch_tab(ActiveTab::Clients),
         KeyCode::Char('3') => state.switch_tab(ActiveTab::Apps),
         KeyCode::Char('4') => state.switch_tab(ActiveTab::Databases),
+        KeyCode::Char('5') => state.switch_tab(ActiveTab::Backups),
         KeyCode::Down | KeyCode::Char('j') => state.nav_down(),
         KeyCode::Up | KeyCode::Char('k') => state.nav_up(),
         KeyCode::Char('a') => state.open_add(),
         KeyCode::Char('d') => state.open_delete(),
         KeyCode::Char('r') => {
-            state.reload(store)?;
+            state.reload(store, cfg)?;
+            let ok = state.doctor_checks.iter().filter(|c| c.ok).count();
+            let fail = state.doctor_checks.iter().filter(|c| !c.ok).count();
             state.status = format!(
-                "actualizado — clients:{} apps:{}",
+                "actualizado — clients:{} apps:{} doctor:{} ok/{} fail",
                 state.clients.len(),
-                state.apps.len()
+                state.apps.len(),
+                ok,
+                fail
             );
         }
         _ => {}
@@ -305,7 +422,7 @@ fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store) -> Result
     Ok(())
 }
 
-fn handle_form_key(state: &mut TuiState, code: KeyCode, store: &Store) -> Result<()> {
+fn handle_form_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Config) -> Result<()> {
     match code {
         KeyCode::Esc => state.modal = Modal::None,
         KeyCode::Tab => {
@@ -342,22 +459,33 @@ fn handle_form_key(state: &mut TuiState, code: KeyCode, store: &Store) -> Result
                 *error = None;
             }
         }
-        KeyCode::Enter => try_submit(state, store)?,
+        KeyCode::Enter => try_submit(state, store, cfg)?,
         _ => {}
     }
     Ok(())
 }
 
-fn handle_confirm_key(state: &mut TuiState, code: KeyCode, store: &Store) -> Result<()> {
+fn handle_confirm_key(
+    state: &mut TuiState,
+    code: KeyCode,
+    store: &Store,
+    cfg: &Config,
+) -> Result<()> {
     match code {
         KeyCode::Esc => state.modal = Modal::None,
-        KeyCode::Enter => try_delete(state, store)?,
+        KeyCode::Enter => try_delete(state, store, cfg)?,
         _ => {}
     }
     Ok(())
 }
 
-fn try_submit(state: &mut TuiState, store: &Store) -> Result<()> {
+fn handle_result_key(state: &mut TuiState, code: KeyCode) {
+    if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+        state.modal = Modal::None;
+    }
+}
+
+fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
     let (kind, data, first_empty) = match &state.modal {
         Modal::Form { kind, fields, .. } => {
             let data: Vec<String> = fields
@@ -394,7 +522,7 @@ fn try_submit(state: &mut TuiState, store: &Store) -> Result<()> {
             match store.add_client(&slug, &name, email) {
                 Ok(client) => {
                     state.modal = Modal::None;
-                    state.reload(store)?;
+                    state.reload(store, cfg)?;
                     state.status = format!("✓ cliente '{}' creado", client.slug);
                     state.switch_tab(ActiveTab::Clients);
                 }
@@ -409,18 +537,71 @@ fn try_submit(state: &mut TuiState, store: &Store) -> Result<()> {
             match store.add_app(&client, &slug, &domain, &upstream) {
                 Ok(app) => {
                     state.modal = Modal::None;
-                    state.reload(store)?;
+                    state.reload(store, cfg)?;
                     state.status = format!("✓ app '{}/{}' creada", app.client_slug, app.slug);
                     state.switch_tab(ActiveTab::Apps);
                 }
                 Err(e) => set_modal_error(&mut state.modal, e.to_string()),
             }
         }
+        FormKind::Provision => {
+            let server_name = data[0].clone();
+            let client = data[1].clone();
+            let app = data[2].clone();
+            let env = data[3].clone();
+            let password = if data[4].is_empty() {
+                rand_password()
+            } else {
+                data[4].clone()
+            };
+            match store.db_server(&server_name) {
+                Err(e) => set_modal_error(&mut state.modal, format!("server no encontrado: {e}")),
+                Ok(server) => {
+                    match db::provision(
+                        cfg, store, &server, &client, &app, &env, "%", None, None, password,
+                    ) {
+                        Ok(p) => {
+                            state.reload(store, cfg)?;
+                            state.modal = Modal::Result {
+                                title: "✓ DB Provisionada".to_string(),
+                                lines: vec![
+                                    format!("Database: {}", p.database),
+                                    format!("Usuario:  {}", p.username),
+                                    format!("Host:     {}", p.host),
+                                    String::new(),
+                                    format!("Password: {}", p.password),
+                                    String::new(),
+                                    "Guarda el password, no se volverá a mostrar.".to_string(),
+                                ],
+                            };
+                            state.switch_tab(ActiveTab::Databases);
+                        }
+                        Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+                    }
+                }
+            }
+        }
+        FormKind::Backup => {
+            let server_name = data[0].clone();
+            let database = data[1].clone();
+            match store.db_server(&server_name) {
+                Err(e) => set_modal_error(&mut state.modal, format!("server no encontrado: {e}")),
+                Ok(server) => match backup::backup(cfg, &server, &database, &cfg.backup_dir) {
+                    Ok(path) => {
+                        state.modal = Modal::None;
+                        state.reload(store, cfg)?;
+                        state.status = format!("✓ backup: {}", path.display());
+                        state.switch_tab(ActiveTab::Backups);
+                    }
+                    Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+                },
+            }
+        }
     }
     Ok(())
 }
 
-fn try_delete(state: &mut TuiState, store: &Store) -> Result<()> {
+fn try_delete(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
     let (kind, id) = match &state.modal {
         Modal::Confirm { kind, id, .. } => (*kind, id.clone()),
         _ => return Ok(()),
@@ -429,14 +610,14 @@ fn try_delete(state: &mut TuiState, store: &Store) -> Result<()> {
         ConfirmKind::DeleteClient => {
             store.delete_client(&id)?;
             state.modal = Modal::None;
-            state.reload(store)?;
+            state.reload(store, cfg)?;
             state.clients_table.select(None);
             state.status = "✓ cliente eliminado".to_string();
         }
         ConfirmKind::DeleteApp => {
             store.delete_app(&id)?;
             state.modal = Modal::None;
-            state.reload(store)?;
+            state.reload(store, cfg)?;
             state.apps_table.select(None);
             state.status = "✓ app eliminada".to_string();
         }
@@ -450,15 +631,20 @@ fn set_modal_error(modal: &mut Modal, err: String) {
     }
 }
 
+fn rand_password() -> String {
+    use rand::distr::{Alphanumeric, SampleString};
+    Alphanumeric.sample_string(&mut rand::rng(), 32)
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
-pub fn run(store: &Store) -> Result<()> {
+pub fn run(store: &Store, cfg: &Config) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut state = TuiState::load(store)?;
+    let mut state = TuiState::load(store, cfg)?;
 
     let result = loop {
         terminal.draw(|frame| draw(frame, &mut state))?;
@@ -471,9 +657,13 @@ pub fn run(store: &Store) -> Result<()> {
                     }
                 }
                 let result = match &state.modal {
-                    Modal::None => handle_main_key(&mut state, key.code, store),
-                    Modal::Form { .. } => handle_form_key(&mut state, key.code, store),
-                    Modal::Confirm { .. } => handle_confirm_key(&mut state, key.code, store),
+                    Modal::None => handle_main_key(&mut state, key.code, store, cfg),
+                    Modal::Form { .. } => handle_form_key(&mut state, key.code, store, cfg),
+                    Modal::Confirm { .. } => handle_confirm_key(&mut state, key.code, store, cfg),
+                    Modal::Result { .. } => {
+                        handle_result_key(&mut state, key.code);
+                        Ok(())
+                    }
                 };
                 if let Err(e) = result {
                     state.status = format!("error: {e}");
@@ -508,6 +698,7 @@ fn draw(frame: &mut Frame, state: &mut TuiState) {
         ActiveTab::Clients => draw_clients(frame, state, chunks[1]),
         ActiveTab::Apps => draw_apps(frame, state, chunks[1]),
         ActiveTab::Databases => draw_databases(frame, state, chunks[1]),
+        ActiveTab::Backups => draw_backups(frame, state, chunks[1]),
     }
 
     draw_statusbar(frame, state, chunks[2]);
@@ -515,10 +706,23 @@ fn draw(frame: &mut Frame, state: &mut TuiState) {
 }
 
 fn draw_tabs(frame: &mut Frame, state: &TuiState, area: Rect) {
-    let titles: Vec<Line> = ["1 Dashboard", "2 Clients", "3 Apps", "4 Databases"]
-        .iter()
-        .map(|t| Line::from(*t))
-        .collect();
+    let ok = state.doctor_checks.iter().filter(|c| c.ok).count();
+    let fail = state.doctor_checks.iter().filter(|c| !c.ok).count();
+    let doctor_label = if !state.doctor_loaded {
+        "1 Dashboard".to_string()
+    } else if fail > 0 {
+        format!("1 Dashboard ✗{fail}")
+    } else {
+        format!("1 Dashboard ✓{ok}")
+    };
+
+    let titles: Vec<Line> = vec![
+        Line::from(doctor_label),
+        Line::from("2 Clients"),
+        Line::from("3 Apps"),
+        Line::from("4 Databases"),
+        Line::from("5 Backups"),
+    ];
     let tabs = Tabs::new(titles)
         .block(
             Block::default()
@@ -541,10 +745,16 @@ fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
     } else {
         match state.tab {
             ActiveTab::Clients | ActiveTab::Apps => {
-                "  Tab/1-4: tab   ↑↓/j-k: nav   a: agregar   d: eliminar   r: refresh   q: salir"
+                "  Tab/1-5: tab   ↑↓/j-k: nav   a: add   d: delete   r: refresh   q: quit"
                     .to_string()
             }
-            _ => "  Tab/1-4: tab   ↑↓/j-k: nav   r: refresh   q: salir".to_string(),
+            ActiveTab::Databases => {
+                "  Tab/1-5: tab   ↑↓/j-k: nav   a: provisionar   r: refresh   q: quit".to_string()
+            }
+            ActiveTab::Backups => {
+                "  Tab/1-5: tab   ↑↓/j-k: nav   a: nuevo backup   r: refresh   q: quit".to_string()
+            }
+            ActiveTab::Dashboard => "  Tab/1-5: tab   r: refresh doctor   q: quit".to_string(),
         }
     };
     frame.render_widget(
@@ -556,9 +766,10 @@ fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
 fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(area);
 
+    // Left: summary
     let summary: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![
@@ -589,9 +800,9 @@ fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("  DB Grants:  ", Style::default().fg(Color::Gray)),
+            Span::styled("  Backups:    ", Style::default().fg(Color::Gray)),
             Span::styled(
-                state.grants.len().to_string(),
+                state.backups.len().to_string(),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -620,24 +831,42 @@ fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
         chunks[0],
     );
 
-    let app_lines: Vec<Line> = std::iter::once(Line::from(""))
-        .chain(state.apps.iter().map(|a| {
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}/{}", a.client_slug, a.slug),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::raw(format!("  {}  ", a.domain)),
-                Span::styled(
-                    format!("→ {}", a.upstream),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
-        }))
-        .collect();
+    // Right: doctor checks
+    let doctor_lines: Vec<Line> = if !state.doctor_loaded {
+        vec![Line::from("  Ejecutando checks...")]
+    } else {
+        std::iter::once(Line::from(""))
+            .chain(state.doctor_checks.iter().map(|check| {
+                let (marker, color) = if check.ok {
+                    ("✓", Color::Green)
+                } else {
+                    ("✗", Color::Red)
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {marker} "),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(check.name.clone(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!(" — {}", check.detail),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            }))
+            .collect()
+    };
+
+    let ok = state.doctor_checks.iter().filter(|c| c.ok).count();
+    let fail = state.doctor_checks.iter().filter(|c| !c.ok).count();
+    let title = if state.doctor_loaded {
+        format!(" Doctor — {ok} ok / {fail} fail ")
+    } else {
+        " Doctor ".to_string()
+    };
 
     frame.render_widget(
-        Paragraph::new(app_lines).block(Block::default().borders(Borders::ALL).title(" Apps ")),
+        Paragraph::new(doctor_lines).block(Block::default().borders(Borders::ALL).title(title)),
         chunks[1],
     );
 }
@@ -662,7 +891,6 @@ fn draw_clients(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             ])
         })
         .collect();
-
     let table = Table::new(
         rows,
         [
@@ -683,7 +911,6 @@ fn draw_clients(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
-
     frame.render_stateful_widget(table, area, &mut state.clients_table);
 }
 
@@ -708,7 +935,6 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             ])
         })
         .collect();
-
     let table = Table::new(
         rows,
         [
@@ -730,7 +956,6 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
-
     frame.render_stateful_widget(table, area, &mut state.apps_table);
 }
 
@@ -759,7 +984,6 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             ])
         })
         .collect();
-
     let servers_table = Table::new(
         server_rows,
         [
@@ -770,17 +994,15 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         ],
     )
     .header(server_header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" DB Servers ({}) ", state.db_servers.len())),
-    )
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " DB Servers ({}) — a: provisionar ",
+        state.db_servers.len()
+    )))
     .row_highlight_style(
         Style::default()
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
-
     frame.render_stateful_widget(servers_table, chunks[0], &mut state.db_table);
 
     let selected_server = state
@@ -788,7 +1010,6 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         .selected()
         .and_then(|i| state.db_servers.get(i))
         .map(|s| s.name.clone());
-
     let filtered_grants: Vec<&DatabaseGrant> = state
         .grants
         .iter()
@@ -799,12 +1020,10 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
                 .unwrap_or(true)
         })
         .collect();
-
     let grants_title = match &selected_server {
         Some(name) => format!(" Grants — {} ({}) ", name, filtered_grants.len()),
         None => format!(" Grants ({}) ", filtered_grants.len()),
     };
-
     let grant_header = Row::new(vec!["Client", "App", "Env", "Database", "User", "Host"])
         .style(
             Style::default()
@@ -825,7 +1044,6 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             ])
         })
         .collect();
-
     let grants_table = Table::new(
         grant_rows,
         [
@@ -839,8 +1057,49 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     )
     .header(grant_header)
     .block(Block::default().borders(Borders::ALL).title(grants_title));
-
     frame.render_widget(grants_table, chunks[1]);
+}
+
+fn draw_backups(frame: &mut Frame, state: &mut TuiState, area: Rect) {
+    let header = Row::new(vec!["Server", "Database", "File", "Size"])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
+    let rows: Vec<Row> = state
+        .backups
+        .iter()
+        .map(|b| {
+            Row::new(vec![
+                Cell::from(b.server.clone()),
+                Cell::from(b.database.clone()),
+                Cell::from(b.filename.clone()),
+                Cell::from(format_size(b.size_bytes)),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(15),
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+            Constraint::Percentage(15),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Backups ({}) — a: nuevo backup ",
+        state.backups.len()
+    )))
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(table, area, &mut state.backups_table);
 }
 
 // ── Modal rendering ───────────────────────────────────────────────────────────
@@ -866,6 +1125,12 @@ fn draw_modal(frame: &mut Frame, modal: &mut Modal, area: Rect) {
             frame.render_widget(Clear, popup);
             draw_confirm(frame, message, popup);
         }
+        Modal::Result { title, lines } => {
+            let height = (lines.len() + 5) as u16;
+            let popup = centered_rect(60, height, area);
+            frame.render_widget(Clear, popup);
+            draw_result(frame, title, lines, popup);
+        }
     }
 }
 
@@ -886,24 +1151,23 @@ fn draw_form(
 
     let mut constraints: Vec<Constraint> = Vec::new();
     for _ in fields {
-        constraints.push(Constraint::Length(1)); // label
-        constraints.push(Constraint::Length(3)); // input
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(3));
     }
     if error.is_some() {
         constraints.push(Constraint::Length(1));
     }
-    constraints.push(Constraint::Length(1)); // hint
+    constraints.push(Constraint::Length(1));
     constraints.push(Constraint::Min(0));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(inner);
-
     let mut idx = 0;
+
     for (i, field) in fields.iter().enumerate() {
         let focused = i == focus;
-
         let label = format!(" {}{}", field.label, if field.required { " *" } else { "" });
         let label_style = if focused {
             Style::default()
@@ -931,7 +1195,6 @@ fn draw_form(
         } else {
             Style::default().fg(Color::DarkGray)
         };
-
         frame.render_widget(
             Paragraph::new(format!(" {display}"))
                 .style(value_style)
@@ -967,7 +1230,6 @@ fn draw_confirm(frame: &mut Frame, message: &str, area: Rect) {
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
     let lines = message.lines().count() as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -978,7 +1240,6 @@ fn draw_confirm(frame: &mut Frame, message: &str, area: Rect) {
             Constraint::Min(0),
         ])
         .split(inner);
-
     frame.render_widget(
         Paragraph::new(message.to_string()).style(Style::default().fg(Color::Yellow)),
         chunks[0],
@@ -986,6 +1247,51 @@ fn draw_confirm(frame: &mut Frame, message: &str, area: Rect) {
     frame.render_widget(
         Paragraph::new("  Enter: confirmar   Esc: cancelar")
             .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn draw_result(frame: &mut Frame, title: &str, lines: &[String], area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string())
+        .border_style(Style::default().fg(Color::Green));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let line_count = lines.len() as u16;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(line_count),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let content: Vec<Line> = lines
+        .iter()
+        .map(|l| {
+            if l.starts_with("Password:") {
+                Line::from(vec![
+                    Span::styled("Password: ", Style::default().fg(Color::White)),
+                    Span::styled(
+                        l.trim_start_matches("Password: ").to_string(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            } else {
+                Line::from(l.clone())
+            }
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(content), chunks[0]);
+    frame.render_widget(
+        Paragraph::new("  Enter/Esc: cerrar").style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
 }

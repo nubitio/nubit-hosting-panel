@@ -216,7 +216,7 @@ fn main() -> Result<()> {
             println!("caddy:  {}", cfg.caddyfile_path.display());
             println!("managed:{}", cfg.caddy_managed_path.display());
         }
-        Command::Tui => tui::run(&store)?,
+        Command::Tui => tui::run(&store, &cfg)?,
         Command::Status => print_status(&cfg, &store)?,
         Command::Doctor => {
             let checks = doctor::run(&cfg, &store)?;

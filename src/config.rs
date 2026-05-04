@@ -12,6 +12,8 @@ pub struct Config {
     pub caddy_reload_command: Option<String>,
     #[serde(default = "default_sqlcmd_path")]
     pub mssql_sqlcmd_path: String,
+    #[serde(default = "default_backup_dir")]
+    pub backup_dir: PathBuf,
     #[serde(default)]
     pub db_servers: HashMap<String, DbServerSecret>,
 }
@@ -61,6 +63,7 @@ impl Config {
                 "docker exec caddy caddy reload --config /etc/caddy/Caddyfile".to_string(),
             ),
             mssql_sqlcmd_path: "/opt/mssql-tools18/bin/sqlcmd".to_string(),
+            backup_dir: PathBuf::from("./backups"),
             db_servers: HashMap::new(),
         })
     }
@@ -88,6 +91,10 @@ impl Config {
 
 fn default_sqlcmd_path() -> String {
     "/opt/mssql-tools18/bin/sqlcmd".to_string()
+}
+
+fn default_backup_dir() -> PathBuf {
+    PathBuf::from("./backups")
 }
 
 fn env_key(value: &str) -> String {
