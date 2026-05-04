@@ -49,6 +49,58 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Cada entrada es una migración numerada desde 1.
+/// Para agregar schema nuevo:
+///   1. push una nueva entrada a este array
+///   2. el binario aplicará automáticamente solo las migraciones pendientes
+/// NO modificar migraciones existentes.
+const MIGRATIONS: &[&str] = &[
+    // v1 — schema inicial
+    r#"
+    CREATE TABLE IF NOT EXISTS clients (
+        id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        email TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS apps (
+        id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+        slug TEXT NOT NULL,
+        domain TEXT NOT NULL UNIQUE,
+        upstream TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(client_id, slug)
+    );
+
+    CREATE TABLE IF NOT EXISTS db_servers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        host TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS database_grants (
+        id TEXT PRIMARY KEY,
+        server_id TEXT NOT NULL REFERENCES db_servers(id) ON DELETE CASCADE,
+        client_id TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+        app_id TEXT REFERENCES apps(id) ON DELETE SET NULL,
+        env TEXT NOT NULL DEFAULT 'prod',
+        db_name TEXT NOT NULL,
+        username TEXT NOT NULL,
+        host TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(server_id, db_name, username, host)
+    );
+    "#,
+    // v2 — ejemplo futuro:
+    // r#"ALTER TABLE clients ADD COLUMN notes TEXT;"#,
+];
+
 impl Store {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -61,51 +113,19 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            PRAGMA foreign_keys = ON;
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
-            CREATE TABLE IF NOT EXISTS clients (
-                id TEXT PRIMARY KEY,
-                slug TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                email TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS apps (
-                id TEXT PRIMARY KEY,
-                client_id TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-                slug TEXT NOT NULL,
-                domain TEXT NOT NULL UNIQUE,
-                upstream TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(client_id, slug)
-            );
-
-            CREATE TABLE IF NOT EXISTS db_servers (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                kind TEXT NOT NULL,
-                host TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS database_grants (
-                id TEXT PRIMARY KEY,
-                server_id TEXT NOT NULL REFERENCES db_servers(id) ON DELETE CASCADE,
-                client_id TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-                app_id TEXT REFERENCES apps(id) ON DELETE SET NULL,
-                env TEXT NOT NULL DEFAULT 'prod',
-                db_name TEXT NOT NULL,
-                username TEXT NOT NULL,
-                host TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(server_id, db_name, username, host)
-            );
-            "#,
-        )?;
+        for (i, migration) in MIGRATIONS.iter().enumerate() {
+            let target = (i + 1) as i64;
+            if version < target {
+                self.conn.execute_batch(migration)?;
+                self.conn
+                    .execute_batch(&format!("PRAGMA user_version = {target}"))?;
+            }
+        }
         Ok(())
     }
 
@@ -380,5 +400,28 @@ mod tests {
         assert!(validate_slug("PorteroSeguro").is_err());
         assert!(validate_slug("portero seguro").is_err());
         assert!(validate_slug("../x").is_err());
+    }
+
+    #[test]
+    fn migrations_set_user_version() {
+        let tmp = tempfile();
+        let store = Store::open(&tmp).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn migrations_are_idempotent() {
+        let tmp = tempfile();
+        Store::open(&tmp).unwrap();
+        // opening again must not fail
+        Store::open(&tmp).unwrap();
+    }
+
+    fn tempfile() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hostingctl-test-{}.sqlite3", uuid::Uuid::new_v4()))
     }
 }
