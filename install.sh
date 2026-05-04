@@ -1,5 +1,5 @@
 #!/bin/sh
-# hostingctl installer — macOS and Linux
+# hostingctl installer — Linux servers only
 # Usage: curl -fsSL https://github.com/nubitio/nubit-hosting-panel/releases/latest/download/install.sh | sh
 set -e
 
@@ -17,28 +17,22 @@ done
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
-case "${OS}" in
-  Linux)
-    case "${ARCH}" in
-      x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-      aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
-      *) echo "error: unsupported Linux architecture: ${ARCH}" >&2; exit 1 ;;
-    esac
-    ;;
-  Darwin)
-    case "${ARCH}" in
-      x86_64) TARGET="x86_64-apple-darwin" ;;
-      arm64) TARGET="aarch64-apple-darwin" ;;
-      *) echo "error: unsupported macOS architecture: ${ARCH}" >&2; exit 1 ;;
-    esac
-    ;;
-  *) echo "error: unsupported operating system: ${OS}" >&2; exit 1 ;;
+
+if [ "${OS}" != "Linux" ]; then
+  echo "error: hostingctl installer supports Linux servers only; detected ${OS}" >&2
+  exit 1
+fi
+
+case "${ARCH}" in
+  x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+  aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+  *) echo "error: unsupported Linux architecture: ${ARCH}" >&2; exit 1 ;;
 esac
 
 if [ -n "${PREFIX}" ]; then
   BIN_DIR="${PREFIX}/bin"
 else
-  BIN_DIR="${HOME}/.local/bin"
+  BIN_DIR="/usr/local/bin"
 fi
 
 if [ -n "${HOSTINGCTL_VERSION:-}" ]; then
@@ -63,23 +57,26 @@ trap 'rm -rf "${TMPDIR}"' EXIT
 echo "Downloading hostingctl ${VERSION} for ${TARGET}…"
 curl -fsSL "${URL}" -o "${TMPDIR}/${ARCHIVE}"
 
-if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then
-  echo "Verifying checksum…"
-  curl -fsSL "${URL}.sha256" -o "${TMPDIR}/${ARCHIVE}.sha256"
-  (cd "${TMPDIR}" && sha256sum -c "${ARCHIVE}.sha256" 2>/dev/null) || \
-  (cd "${TMPDIR}" && shasum -a 256 -c "${ARCHIVE}.sha256")
-fi
+echo "Verifying checksum…"
+curl -fsSL "${URL}.sha256" -o "${TMPDIR}/${ARCHIVE}.sha256"
+(cd "${TMPDIR}" && sha256sum -c "${ARCHIVE}.sha256")
 
 echo "Installing to ${BIN_DIR}…"
 tar -xzf "${TMPDIR}/${ARCHIVE}" -C "${TMPDIR}"
-mkdir -p "${BIN_DIR}"
-cp "${TMPDIR}/hostingctl-${VERSION}-${TARGET}/${BINARY}" "${BIN_DIR}/${BINARY}"
-chmod +x "${BIN_DIR}/${BINARY}"
+
+if [ -w "${BIN_DIR}" ] || { [ ! -e "${BIN_DIR}" ] && [ -w "$(dirname "${BIN_DIR}")" ]; }; then
+  mkdir -p "${BIN_DIR}"
+  cp "${TMPDIR}/hostingctl-${VERSION}-${TARGET}/${BINARY}" "${BIN_DIR}/${BINARY}"
+  chmod +x "${BIN_DIR}/${BINARY}"
+elif command -v sudo >/dev/null 2>&1; then
+  sudo mkdir -p "${BIN_DIR}"
+  sudo cp "${TMPDIR}/hostingctl-${VERSION}-${TARGET}/${BINARY}" "${BIN_DIR}/${BINARY}"
+  sudo chmod +x "${BIN_DIR}/${BINARY}"
+else
+  echo "error: ${BIN_DIR} is not writable and sudo is unavailable" >&2
+  echo "       retry with --prefix ~/.local or run as root" >&2
+  exit 1
+fi
 
 echo "✓ hostingctl ${VERSION} installed to ${BIN_DIR}/${BINARY}"
-case ":${PATH}:" in
-  *":${BIN_DIR}:"*) ;;
-  *) echo "Add to PATH: export PATH=\"${BIN_DIR}:\$PATH\"" ;;
-esac
-
 echo "Get started: hostingctl init && hostingctl tui"

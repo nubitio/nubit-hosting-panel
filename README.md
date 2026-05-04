@@ -16,7 +16,7 @@
 - DB servers sin secretos en SQLite.
 - Credenciales DB por env var o `config.toml`; env var tiene prioridad.
 - MariaDB/MySQL: crear databases, crear usuarios, grants, provision y reset password.
-- GitHub Actions release con artefactos `.tar.gz`, checksums e `install.sh`.
+- GitHub Actions release Linux-only con artefactos `.tar.gz`, checksums e `install.sh`.
 
 ## Uso local
 
@@ -137,8 +137,14 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Instalación:
+Instalación Linux server:
 
 ```sh
 curl -fsSL https://github.com/nubitio/nubit-hosting-panel/releases/latest/download/install.sh | sh
+```
+
+Por defecto instala en `/usr/local/bin`; puedes usar `--prefix`:
+
+```sh
+curl -fsSL https://github.com/nubitio/nubit-hosting-panel/releases/latest/download/install.sh | sh -s -- --prefix ~/.local
 ```
