@@ -70,6 +70,10 @@ pub fn run(cfg: &Config, store: &Store) -> Result<Vec<Check>> {
                 err.to_string(),
             )),
         }
+
+        if server.kind == "mssql" {
+            checks.push(mssql_sqlcmd_check(cfg, &server.name));
+        }
     }
 
     Ok(checks)
@@ -118,6 +122,37 @@ fn path_exists(name: &str, path: &Path) -> Check {
         Check::ok(name, path.display().to_string())
     } else {
         Check::fail(name, format!("no existe: {}", path.display()))
+    }
+}
+
+fn mssql_sqlcmd_check(cfg: &Config, container: &str) -> Check {
+    let path = &cfg.mssql_sqlcmd_path;
+    match Command::new("docker")
+        .args(["exec", container, "test", "-x", path])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            Check::ok(format!("sqlcmd {container}"), path.clone())
+        }
+        _ => {
+            // Try go-sqlcmd fallback
+            match Command::new("docker")
+                .args(["exec", container, "which", "sqlcmd"])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    Check::ok(
+                        format!("sqlcmd {container}"),
+                        format!("{found} (go-sqlcmd; actualiza mssql_sqlcmd_path en config.toml)"),
+                    )
+                }
+                _ => Check::fail(
+                    format!("sqlcmd {container}"),
+                    format!("no encontrado en {path}; verifica mssql_sqlcmd_path en config.toml"),
+                ),
+            }
+        }
     }
 }
 
