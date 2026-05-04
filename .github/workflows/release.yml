@@ -13,78 +13,54 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  build-x86:
-    name: Build — x86_64-unknown-linux-gnu
+  build:
+    name: Build — ${{ matrix.target }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            use_cross: true
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-unknown-linux-gnu
+          key: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --target x86_64-unknown-linux-gnu
-
-      - name: Package
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME}"
-          TARGET="x86_64-unknown-linux-gnu"
-          ARCHIVE_NAME="hostingctl-${VERSION}-${TARGET}"
-          mkdir -p "dist/${ARCHIVE_NAME}"
-          cp "target/${TARGET}/release/hostingctl" "dist/${ARCHIVE_NAME}/"
-          cp README.md LICENSE "dist/${ARCHIVE_NAME}/" 2>/dev/null || true
-          cd dist
-          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}/"
-          sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86_64-unknown-linux-gnu
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
-
-  build-arm64:
-    name: Build — aarch64-unknown-linux-gnu
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: aarch64-unknown-linux-gnu
-
-      - name: Install cross
+      - name: Install cross (Linux ARM64 only)
+        if: matrix.use_cross == true
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build
-        run: cross build --release --target aarch64-unknown-linux-gnu
+      - name: Build (native)
+        if: matrix.use_cross != true
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          TARGET="aarch64-unknown-linux-gnu"
-          ARCHIVE_NAME="hostingctl-${VERSION}-${TARGET}"
+          BINARY="hostingctl"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE_NAME="${BINARY}-${VERSION}-${TARGET}"
+
           mkdir -p "dist/${ARCHIVE_NAME}"
-          cp "target/${TARGET}/release/hostingctl" "dist/${ARCHIVE_NAME}/"
-          cp README.md LICENSE "dist/${ARCHIVE_NAME}/" 2>/dev/null || true
+          cp "target/${TARGET}/release/${BINARY}" "dist/${ARCHIVE_NAME}/"
+          cp README.md LICENSE dist/${ARCHIVE_NAME}/ 2>/dev/null || true
+
           cd dist
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}/"
           sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
@@ -92,14 +68,14 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aarch64-unknown-linux-gnu
+          name: ${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.sha256
 
   release:
     name: Create GitHub Release
-    needs: build-x86
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
