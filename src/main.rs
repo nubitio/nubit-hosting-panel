@@ -5,6 +5,7 @@ mod db;
 mod doctor;
 mod export;
 mod mssql;
+mod schedule;
 mod store;
 mod tui;
 
@@ -200,6 +201,20 @@ enum DbSubcommand {
         #[arg(long)]
         database: Option<String>,
     },
+    BackupAll {
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    InstallTimer {
+        #[arg(long, default_value = "daily")]
+        schedule: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value = "/usr/local/bin/hostingctl")]
+        binary: String,
+    },
+    TimerStatus,
+    UninstallTimer,
 }
 
 fn main() -> Result<()> {
@@ -454,6 +469,69 @@ fn main() -> Result<()> {
                 for file in files {
                     println!("{}", file.display());
                 }
+            }
+            DbSubcommand::BackupAll { out } => {
+                let out_dir = out.unwrap_or_else(|| cfg.backup_dir.clone());
+                let grants = store.list_database_grants()?;
+                let mut seen = std::collections::HashSet::new();
+                let mut ok = 0usize;
+                let mut errs = 0usize;
+                for grant in &grants {
+                    let key = (grant.server_name.clone(), grant.db_name.clone());
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    match store.db_server(&grant.server_name) {
+                        Err(e) => {
+                            eprintln!("[skip] {} — {}", grant.server_name, e);
+                            errs += 1;
+                        }
+                        Ok(server) => match backup::backup(&cfg, &server, &grant.db_name, &out_dir)
+                        {
+                            Ok(path) => {
+                                println!("✓ {} — {}", grant.db_name, path.display());
+                                ok += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("✗ {} — {}", grant.db_name, e);
+                                errs += 1;
+                            }
+                        },
+                    }
+                }
+                println!("\n{} backups OK, {} errores", ok, errs);
+                if errs > 0 {
+                    std::process::exit(1);
+                }
+            }
+            DbSubcommand::InstallTimer {
+                schedule,
+                out,
+                binary,
+            } => {
+                let out_dir = out.unwrap_or_else(|| cfg.backup_dir.clone());
+                schedule::install(&schedule, &out_dir, &binary)?;
+                println!("✓ timer instalado: hostingctl-backup.timer ({})", schedule);
+                println!("  logs:   journalctl -u hostingctl-backup.service");
+                println!("  status: hostingctl db timer-status");
+            }
+            DbSubcommand::TimerStatus => {
+                let s = schedule::status()?;
+                println!("service: {}", s.service_path);
+                println!("timer:   {}", s.timer_path);
+                println!("enabled: {}", s.enabled);
+                println!(
+                    "last:    {}",
+                    s.last_run.unwrap_or_else(|| "never".to_string())
+                );
+                println!(
+                    "next:    {}",
+                    s.next_run.unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            DbSubcommand::UninstallTimer => {
+                schedule::uninstall()?;
+                println!("✓ timer desinstalado");
             }
         },
     }

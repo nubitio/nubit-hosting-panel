@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::{
-    backup,
+    backup, caddy,
     config::Config,
     db, doctor,
     store::{App as HostingApp, Client, DatabaseGrant, DbServer, Store},
@@ -253,6 +253,7 @@ enum ConfirmKind {
     DeleteClient,
     DeleteApp,
     RestoreBackup,
+    CaddyApply,
 }
 
 enum Modal {
@@ -710,6 +711,16 @@ fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Con
         KeyCode::Up | KeyCode::Char('k') => state.nav_up(),
         KeyCode::Char('a') => state.open_add(),
         KeyCode::Char('d') => state.open_delete(),
+        KeyCode::Char('c') if state.tab == ActiveTab::Apps || state.tab == ActiveTab::Dashboard => {
+            state.modal = Modal::Confirm {
+                message: format!(
+                    "Aplicar Caddyfile y recargar Caddy?\n{} apps serán publicadas.",
+                    state.apps.len()
+                ),
+                kind: ConfirmKind::CaddyApply,
+                payload: String::new(),
+            };
+        }
         KeyCode::Char('p') if state.tab == ActiveTab::Databases => state.open_provision(),
         KeyCode::Char('e') if state.tab == ActiveTab::Databases => state.open_reset_password(),
         KeyCode::Enter if state.tab == ActiveTab::Backups => state.open_restore(),
@@ -979,6 +990,22 @@ fn try_confirm(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> 
             state.apps_table.select(None);
             state.status = "✓ app eliminada".to_string();
         }
+        ConfirmKind::CaddyApply => match caddy::apply(cfg, &state.apps, true) {
+            Ok(()) => {
+                state.modal = Modal::Result {
+                    title: "✓ Caddy Aplicado".to_string(),
+                    lines: vec![
+                        format!("{} apps aplicadas.", state.apps.len()),
+                        String::new(),
+                        format!("Managed: {}", cfg.caddy_managed_path.display()),
+                    ],
+                };
+            }
+            Err(e) => {
+                state.modal = Modal::None;
+                state.status = format!("error caddy apply: {e}");
+            }
+        },
         ConfirmKind::RestoreBackup => {
             let path = std::path::Path::new(&payload);
             let rel = path.strip_prefix(&cfg.backup_dir).unwrap_or(path);
@@ -1137,8 +1164,9 @@ fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
         state.status.clone()
     } else {
         match state.tab {
-            ActiveTab::Clients | ActiveTab::Apps =>
-                "  Tab/1-5: tab   ↑↓: nav   a: add   d: delete   r: refresh   q: quit".to_string(),
+            ActiveTab::Clients => "  Tab/1-5: tab   ↑↓: nav   a: add   d: delete   r: refresh   q: quit".to_string(),
+            ActiveTab::Apps =>
+                "  Tab/1-5: tab   ↑↓: nav   a: add   d: delete   c: caddy apply   r: refresh   q: quit".to_string(),
             ActiveTab::Databases => match state.db_focus {
                 DbFocus::Servers => "  Tab: foco grants   ↑↓: nav   a: add server   p: provisionar   r: refresh   q: quit".to_string(),
                 DbFocus::Grants  => "  Tab: foco servers   ↑↓: nav   e: reset password   r: refresh   q: quit".to_string(),
