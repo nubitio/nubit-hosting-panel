@@ -12,10 +12,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs},
 };
 
 use crate::store::{App as HostingApp, Client, DatabaseGrant, DbServer, Store};
+
+// ── Tab ───────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
@@ -34,7 +36,6 @@ impl ActiveTab {
             Self::Databases => 3,
         }
     }
-
     fn from_index(i: usize) -> Self {
         match i {
             1 => Self::Clients,
@@ -43,15 +44,89 @@ impl ActiveTab {
             _ => Self::Dashboard,
         }
     }
-
     fn next(self) -> Self {
         Self::from_index((self.index() + 1) % 4)
     }
-
     fn prev(self) -> Self {
         Self::from_index((self.index() + 3) % 4)
     }
 }
+
+// ── Input / Form ──────────────────────────────────────────────────────────────
+
+#[derive(Default, Clone)]
+struct Input {
+    pub value: String,
+}
+
+impl Input {
+    fn push(&mut self, c: char) {
+        self.value.push(c);
+    }
+    fn pop(&mut self) {
+        self.value.pop();
+    }
+}
+
+struct FormField {
+    label: &'static str,
+    input: Input,
+    required: bool,
+    placeholder: &'static str,
+}
+
+impl FormField {
+    fn req(label: &'static str, placeholder: &'static str) -> Self {
+        Self {
+            label,
+            input: Input::default(),
+            required: true,
+            placeholder,
+        }
+    }
+    fn opt(label: &'static str, placeholder: &'static str) -> Self {
+        Self {
+            label,
+            input: Input::default(),
+            required: false,
+            placeholder,
+        }
+    }
+    fn prefill(mut self, value: &str) -> Self {
+        self.input.value = value.to_string();
+        self
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FormKind {
+    AddClient,
+    AddApp,
+}
+
+#[derive(Clone, Copy)]
+enum ConfirmKind {
+    DeleteClient,
+    DeleteApp,
+}
+
+enum Modal {
+    None,
+    Form {
+        title: &'static str,
+        fields: Vec<FormField>,
+        focus: usize,
+        kind: FormKind,
+        error: Option<String>,
+    },
+    Confirm {
+        message: String,
+        kind: ConfirmKind,
+        id: String,
+    },
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
 
 struct TuiState {
     tab: ActiveTab,
@@ -63,6 +138,7 @@ struct TuiState {
     apps_table: TableState,
     db_table: TableState,
     status: String,
+    modal: Modal,
 }
 
 impl TuiState {
@@ -77,6 +153,7 @@ impl TuiState {
             apps_table: TableState::default(),
             db_table: TableState::default(),
             status: String::new(),
+            modal: Modal::None,
         })
     }
 
@@ -85,14 +162,12 @@ impl TuiState {
         self.apps = store.list_apps()?;
         self.db_servers = store.list_db_servers()?;
         self.grants = store.list_database_grants()?;
-        self.status = format!(
-            "reloaded — clients:{} apps:{} db_servers:{} grants:{}",
-            self.clients.len(),
-            self.apps.len(),
-            self.db_servers.len(),
-            self.grants.len()
-        );
         Ok(())
+    }
+
+    fn switch_tab(&mut self, tab: ActiveTab) {
+        self.tab = tab;
+        self.status.clear();
     }
 
     fn nav_down(&mut self) {
@@ -113,9 +188,74 @@ impl TuiState {
         }
     }
 
-    fn switch_tab(&mut self, tab: ActiveTab) {
-        self.tab = tab;
-        self.status.clear();
+    fn open_add(&mut self) {
+        match self.tab {
+            ActiveTab::Clients => {
+                self.modal = Modal::Form {
+                    title: " Agregar Cliente ",
+                    fields: vec![
+                        FormField::req("Slug", "ej: acme-corp"),
+                        FormField::req("Nombre", "ej: Acme Corp"),
+                        FormField::opt("Email", "ej: ops@acme.com"),
+                    ],
+                    focus: 0,
+                    kind: FormKind::AddClient,
+                    error: None,
+                };
+            }
+            ActiveTab::Apps => {
+                let prefill = self
+                    .clients_table
+                    .selected()
+                    .and_then(|i| self.clients.get(i))
+                    .map(|c| c.slug.as_str())
+                    .unwrap_or("");
+                self.modal = Modal::Form {
+                    title: " Agregar App ",
+                    fields: vec![
+                        FormField::req("Cliente (slug)", "ej: acme-corp").prefill(prefill),
+                        FormField::req("App slug", "ej: web"),
+                        FormField::req("Dominio", "ej: acme.nubit.site"),
+                        FormField::req("Upstream", "ej: container_name:8080"),
+                    ],
+                    focus: 0,
+                    kind: FormKind::AddApp,
+                    error: None,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn open_delete(&mut self) {
+        match self.tab {
+            ActiveTab::Clients => {
+                if let Some(client) = self
+                    .clients_table
+                    .selected()
+                    .and_then(|i| self.clients.get(i))
+                {
+                    self.modal = Modal::Confirm {
+                        message: format!(
+                            "Eliminar cliente '{}'?\nSe eliminarán también todas sus apps.",
+                            client.slug
+                        ),
+                        kind: ConfirmKind::DeleteClient,
+                        id: client.id.clone(),
+                    };
+                }
+            }
+            ActiveTab::Apps => {
+                if let Some(app) = self.apps_table.selected().and_then(|i| self.apps.get(i)) {
+                    self.modal = Modal::Confirm {
+                        message: format!("Eliminar app '{}/{}'?", app.client_slug, app.slug),
+                        kind: ConfirmKind::DeleteApp,
+                        id: app.id.clone(),
+                    };
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -138,6 +278,180 @@ fn nav_up(state: &mut TableState, len: usize) {
     state.select(Some(prev));
 }
 
+// ── Event handling ────────────────────────────────────────────────────────────
+
+fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store) -> Result<()> {
+    match code {
+        KeyCode::Tab => state.switch_tab(state.tab.next()),
+        KeyCode::BackTab => state.switch_tab(state.tab.prev()),
+        KeyCode::Char('1') => state.switch_tab(ActiveTab::Dashboard),
+        KeyCode::Char('2') => state.switch_tab(ActiveTab::Clients),
+        KeyCode::Char('3') => state.switch_tab(ActiveTab::Apps),
+        KeyCode::Char('4') => state.switch_tab(ActiveTab::Databases),
+        KeyCode::Down | KeyCode::Char('j') => state.nav_down(),
+        KeyCode::Up | KeyCode::Char('k') => state.nav_up(),
+        KeyCode::Char('a') => state.open_add(),
+        KeyCode::Char('d') => state.open_delete(),
+        KeyCode::Char('r') => {
+            state.reload(store)?;
+            state.status = format!(
+                "actualizado — clients:{} apps:{}",
+                state.clients.len(),
+                state.apps.len()
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_form_key(state: &mut TuiState, code: KeyCode, store: &Store) -> Result<()> {
+    match code {
+        KeyCode::Esc => state.modal = Modal::None,
+        KeyCode::Tab => {
+            if let Modal::Form { focus, fields, .. } = &mut state.modal {
+                *focus = (*focus + 1) % fields.len();
+            }
+        }
+        KeyCode::BackTab => {
+            if let Modal::Form { focus, fields, .. } = &mut state.modal {
+                *focus = (*focus + fields.len() - 1) % fields.len();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Modal::Form {
+                focus,
+                fields,
+                error,
+                ..
+            } = &mut state.modal
+            {
+                fields[*focus].input.push(c);
+                *error = None;
+            }
+        }
+        KeyCode::Backspace => {
+            if let Modal::Form {
+                focus,
+                fields,
+                error,
+                ..
+            } = &mut state.modal
+            {
+                fields[*focus].input.pop();
+                *error = None;
+            }
+        }
+        KeyCode::Enter => try_submit(state, store)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_confirm_key(state: &mut TuiState, code: KeyCode, store: &Store) -> Result<()> {
+    match code {
+        KeyCode::Esc => state.modal = Modal::None,
+        KeyCode::Enter => try_delete(state, store)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn try_submit(state: &mut TuiState, store: &Store) -> Result<()> {
+    let (kind, data, first_empty) = match &state.modal {
+        Modal::Form { kind, fields, .. } => {
+            let data: Vec<String> = fields
+                .iter()
+                .map(|f| f.input.value.trim().to_string())
+                .collect();
+            let first_empty = fields
+                .iter()
+                .enumerate()
+                .find(|(i, f)| f.required && data[*i].is_empty())
+                .map(|(i, f)| (i, f.label));
+            (*kind, data, first_empty)
+        }
+        _ => return Ok(()),
+    };
+
+    if let Some((idx, label)) = first_empty {
+        if let Modal::Form { error, focus, .. } = &mut state.modal {
+            *error = Some(format!("{} es requerido", label));
+            *focus = idx;
+        }
+        return Ok(());
+    }
+
+    match kind {
+        FormKind::AddClient => {
+            let slug = data[0].clone();
+            let name = data[1].clone();
+            let email = if data[2].is_empty() {
+                None
+            } else {
+                Some(data[2].as_str())
+            };
+            match store.add_client(&slug, &name, email) {
+                Ok(client) => {
+                    state.modal = Modal::None;
+                    state.reload(store)?;
+                    state.status = format!("✓ cliente '{}' creado", client.slug);
+                    state.switch_tab(ActiveTab::Clients);
+                }
+                Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+            }
+        }
+        FormKind::AddApp => {
+            let client = data[0].clone();
+            let slug = data[1].clone();
+            let domain = data[2].clone();
+            let upstream = data[3].clone();
+            match store.add_app(&client, &slug, &domain, &upstream) {
+                Ok(app) => {
+                    state.modal = Modal::None;
+                    state.reload(store)?;
+                    state.status = format!("✓ app '{}/{}' creada", app.client_slug, app.slug);
+                    state.switch_tab(ActiveTab::Apps);
+                }
+                Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn try_delete(state: &mut TuiState, store: &Store) -> Result<()> {
+    let (kind, id) = match &state.modal {
+        Modal::Confirm { kind, id, .. } => (*kind, id.clone()),
+        _ => return Ok(()),
+    };
+    match kind {
+        ConfirmKind::DeleteClient => {
+            store.delete_client(&id)?;
+            state.modal = Modal::None;
+            state.reload(store)?;
+            state.clients_table.select(None);
+            state.status = "✓ cliente eliminado".to_string();
+        }
+        ConfirmKind::DeleteApp => {
+            store.delete_app(&id)?;
+            state.modal = Modal::None;
+            state.reload(store)?;
+            state.apps_table.select(None);
+            state.status = "✓ app eliminada".to_string();
+        }
+    }
+    Ok(())
+}
+
+fn set_modal_error(modal: &mut Modal, err: String) {
+    if let Modal::Form { error, .. } = modal {
+        *error = Some(err);
+    }
+}
+
+// ── Main loop ─────────────────────────────────────────────────────────────────
+
 pub fn run(store: &Store) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -151,22 +465,18 @@ pub fn run(store: &Store) -> Result<()> {
 
         if event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                    KeyCode::Tab => state.switch_tab(state.tab.next()),
-                    KeyCode::BackTab => state.switch_tab(state.tab.prev()),
-                    KeyCode::Char('1') => state.switch_tab(ActiveTab::Dashboard),
-                    KeyCode::Char('2') => state.switch_tab(ActiveTab::Clients),
-                    KeyCode::Char('3') => state.switch_tab(ActiveTab::Apps),
-                    KeyCode::Char('4') => state.switch_tab(ActiveTab::Databases),
-                    KeyCode::Down | KeyCode::Char('j') => state.nav_down(),
-                    KeyCode::Up | KeyCode::Char('k') => state.nav_up(),
-                    KeyCode::Char('r') => {
-                        if let Err(err) = state.reload(store) {
-                            state.status = format!("error: {err}");
-                        }
+                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+                    if matches!(state.modal, Modal::None) {
+                        break Ok(());
                     }
-                    _ => {}
+                }
+                let result = match &state.modal {
+                    Modal::None => handle_main_key(&mut state, key.code, store),
+                    Modal::Form { .. } => handle_form_key(&mut state, key.code, store),
+                    Modal::Confirm { .. } => handle_confirm_key(&mut state, key.code, store),
+                };
+                if let Err(e) = result {
+                    state.status = format!("error: {e}");
                 }
             }
         }
@@ -178,7 +488,7 @@ pub fn run(store: &Store) -> Result<()> {
     result
 }
 
-// ── drawing ──────────────────────────────────────────────────────────────────
+// ── Drawing ───────────────────────────────────────────────────────────────────
 
 fn draw(frame: &mut Frame, state: &mut TuiState) {
     let area = frame.area();
@@ -201,6 +511,7 @@ fn draw(frame: &mut Frame, state: &mut TuiState) {
     }
 
     draw_statusbar(frame, state, chunks[2]);
+    draw_modal(frame, &mut state.modal, area);
 }
 
 fn draw_tabs(frame: &mut Frame, state: &TuiState, area: Rect) {
@@ -224,13 +535,31 @@ fn draw_tabs(frame: &mut Frame, state: &TuiState, area: Rect) {
     frame.render_widget(tabs, area);
 }
 
+fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
+    let msg = if !state.status.is_empty() {
+        state.status.clone()
+    } else {
+        match state.tab {
+            ActiveTab::Clients | ActiveTab::Apps => {
+                "  Tab/1-4: tab   ↑↓/j-k: nav   a: agregar   d: eliminar   r: refresh   q: salir"
+                    .to_string()
+            }
+            _ => "  Tab/1-4: tab   ↑↓/j-k: nav   r: refresh   q: salir".to_string(),
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
+        area,
+    );
+}
+
 fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
-    let summary = vec![
+    let summary: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Clients:    ", Style::default().fg(Color::Gray)),
@@ -284,7 +613,7 @@ fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
             .iter()
             .map(|s| Line::from(format!("    {} ({}) {}:{}", s.name, s.kind, s.host, s.port))),
     )
-    .collect::<Vec<_>>();
+    .collect();
 
     frame.render_widget(
         Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(" Summary ")),
@@ -321,7 +650,6 @@ fn draw_clients(frame: &mut Frame, state: &mut TuiState, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
         .height(1);
-
     let rows: Vec<Row> = state
         .clients
         .iter()
@@ -367,7 +695,6 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
         .height(1);
-
     let rows: Vec<Row> = state
         .apps
         .iter()
@@ -420,7 +747,6 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
         .height(1);
-
     let server_rows: Vec<Row> = state
         .db_servers
         .iter()
@@ -469,7 +795,7 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         .filter(|g| {
             selected_server
                 .as_deref()
-                .map(|name| g.server_name == name)
+                .map(|n| g.server_name == n)
                 .unwrap_or(true)
         })
         .collect();
@@ -486,7 +812,6 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
         .height(1);
-
     let grant_rows: Vec<Row> = filtered_grants
         .iter()
         .map(|g| {
@@ -518,14 +843,162 @@ fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     frame.render_widget(grants_table, chunks[1]);
 }
 
-fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
-    let msg = if state.status.is_empty() {
-        "  Tab/1-4: switch tab   ↑↓/j-k: navigate   r: refresh   q: quit".to_string()
-    } else {
-        format!("  {}", state.status)
-    };
+// ── Modal rendering ───────────────────────────────────────────────────────────
+
+fn draw_modal(frame: &mut Frame, modal: &mut Modal, area: Rect) {
+    match modal {
+        Modal::None => {}
+        Modal::Form {
+            title,
+            fields,
+            focus,
+            error,
+            ..
+        } => {
+            let height = (fields.len() * 4 + 4 + usize::from(error.is_some())) as u16;
+            let popup = centered_rect(62, height, area);
+            frame.render_widget(Clear, popup);
+            draw_form(frame, title, fields, *focus, error.as_deref(), popup);
+        }
+        Modal::Confirm { message, .. } => {
+            let lines = message.lines().count() as u16;
+            let popup = centered_rect(54, lines + 5, area);
+            frame.render_widget(Clear, popup);
+            draw_confirm(frame, message, popup);
+        }
+    }
+}
+
+fn draw_form(
+    frame: &mut Frame,
+    title: &str,
+    fields: &[FormField],
+    focus: usize,
+    error: Option<&str>,
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string())
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut constraints: Vec<Constraint> = Vec::new();
+    for _ in fields {
+        constraints.push(Constraint::Length(1)); // label
+        constraints.push(Constraint::Length(3)); // input
+    }
+    if error.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // hint
+    constraints.push(Constraint::Min(0));
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    let mut idx = 0;
+    for (i, field) in fields.iter().enumerate() {
+        let focused = i == focus;
+
+        let label = format!(" {}{}", field.label, if field.required { " *" } else { "" });
+        let label_style = if focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        frame.render_widget(Paragraph::new(label).style(label_style), chunks[idx]);
+        idx += 1;
+
+        let (display, value_style) = if field.input.value.is_empty() && !focused {
+            (
+                field.placeholder.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            (
+                format!("{}{}", field.input.value, if focused { "_" } else { "" }),
+                Style::default().fg(Color::White),
+            )
+        };
+        let border_style = if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        frame.render_widget(
+            Paragraph::new(format!(" {display}"))
+                .style(value_style)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(border_style),
+                ),
+            chunks[idx],
+        );
+        idx += 1;
+    }
+
+    if let Some(err) = error {
+        frame.render_widget(
+            Paragraph::new(format!(" ⚠ {err}")).style(Style::default().fg(Color::Red)),
+            chunks[idx],
+        );
+        idx += 1;
+    }
+
     frame.render_widget(
-        Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
-        area,
+        Paragraph::new("  Tab: siguiente   Shift+Tab: anterior   Enter: confirmar   Esc: cancelar")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[idx],
     );
+}
+
+fn draw_confirm(frame: &mut Frame, message: &str, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Confirmar ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = message.lines().count() as u16;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(lines),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(message.to_string()).style(Style::default().fg(Color::Yellow)),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new("  Enter: confirmar   Esc: cancelar")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let w = (area.width * percent_x / 100).min(area.width);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let h = height.min(area.height);
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }

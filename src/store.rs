@@ -361,6 +361,24 @@ impl Store {
         )?;
         Ok(())
     }
+
+    pub fn delete_client(&self, id: &str) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM clients WHERE id = ?1", [id])?;
+        if changed == 0 {
+            bail!("cliente no encontrado: {}", id);
+        }
+        Ok(())
+    }
+
+    pub fn delete_app(&self, id: &str) -> Result<()> {
+        let changed = self.conn.execute("DELETE FROM apps WHERE id = ?1", [id])?;
+        if changed == 0 {
+            bail!("app no encontrada: {}", id);
+        }
+        Ok(())
+    }
 }
 
 pub fn validate_slug(value: &str) -> Result<()> {
