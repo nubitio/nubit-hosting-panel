@@ -536,6 +536,46 @@ impl TuiState {
             .and_then(|i| self.ssh_users.get(i))
     }
 
+    /// Recalcula las opciones del selector "App" en formularios AddSshUser/EditSshUser
+    /// basándose en el valor actual del campo Cliente (campo 0).
+    fn refresh_ssh_app_options(&mut self) {
+        let is_ssh_user_form = if let Modal::Form { kind, .. } = &self.modal {
+            matches!(kind, FormKind::AddSshUser | FormKind::EditSshUser)
+        } else {
+            false
+        };
+        if !is_ssh_user_form {
+            return;
+        }
+
+        let client_slug = if let Modal::Form { fields, .. } = &self.modal {
+            fields.first().map(|f| f.input.value.clone()).unwrap_or_default()
+        } else {
+            return;
+        };
+
+        let mut new_opts = vec!["(ninguna)".to_string()];
+        new_opts.extend(
+            self.apps
+                .iter()
+                .filter(|a| a.client_slug == client_slug)
+                .map(|a| a.slug.clone()),
+        );
+
+        if let Modal::Form { fields, .. } = &mut self.modal {
+            if let Some(app_field) = fields.last_mut() {
+                if app_field.is_selector() {
+                    let current = app_field.input.value.clone();
+                    app_field.options = new_opts.clone();
+                    if !new_opts.contains(&current) {
+                        app_field.input.value =
+                            new_opts.first().cloned().unwrap_or_default();
+                    }
+                }
+            }
+        }
+    }
+
     fn filtered_aliases(&self) -> Vec<&DomainAlias> {
         let selected_app_id = self
             .apps_table
@@ -1176,8 +1216,23 @@ fn handle_form_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Con
     match code {
         KeyCode::Esc => state.modal = Modal::None,
         KeyCode::Tab => {
+            // Guardar foco anterior para detectar si salimos del campo Cliente
+            let prev_focus = if let Modal::Form { focus, .. } = &state.modal {
+                *focus
+            } else {
+                0
+            };
+            let is_ssh_form = if let Modal::Form { kind, .. } = &state.modal {
+                matches!(kind, FormKind::AddSshUser | FormKind::EditSshUser)
+            } else {
+                false
+            };
             if let Modal::Form { focus, fields, .. } = &mut state.modal {
                 *focus = (*focus + 1) % fields.len();
+            }
+            // Si avanzamos desde el campo Cliente (0), refrescar apps
+            if is_ssh_form && prev_focus == 0 {
+                state.refresh_ssh_app_options();
             }
         }
         KeyCode::BackTab => {
@@ -1187,17 +1242,39 @@ fn handle_form_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Con
         }
         // Selector cycling: ←→ or ↑↓
         KeyCode::Left | KeyCode::Up => {
+            let (is_ssh_form, cur_focus) = if let Modal::Form { kind, focus, .. } = &state.modal {
+                (
+                    matches!(kind, FormKind::AddSshUser | FormKind::EditSshUser),
+                    *focus,
+                )
+            } else {
+                (false, 0)
+            };
             if let Modal::Form { focus, fields, .. } = &mut state.modal {
                 if fields[*focus].is_selector() {
                     fields[*focus].cycle_prev();
                 }
             }
+            if is_ssh_form && cur_focus == 0 {
+                state.refresh_ssh_app_options();
+            }
         }
         KeyCode::Right | KeyCode::Down => {
+            let (is_ssh_form, cur_focus) = if let Modal::Form { kind, focus, .. } = &state.modal {
+                (
+                    matches!(kind, FormKind::AddSshUser | FormKind::EditSshUser),
+                    *focus,
+                )
+            } else {
+                (false, 0)
+            };
             if let Modal::Form { focus, fields, .. } = &mut state.modal {
                 if fields[*focus].is_selector() {
                     fields[*focus].cycle_next();
                 }
+            }
+            if is_ssh_form && cur_focus == 0 {
+                state.refresh_ssh_app_options();
             }
         }
         KeyCode::Char(c) => {
