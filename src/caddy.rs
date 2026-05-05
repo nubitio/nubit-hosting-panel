@@ -138,6 +138,7 @@ mod tests {
             slug: "web".into(),
             domain: "porteroseguro.nubit.site".into(),
             upstream: "tomcat_porteroseguro:8080".into(),
+            notes: None,
             created_at: Utc::now(),
         }], &[]);
 

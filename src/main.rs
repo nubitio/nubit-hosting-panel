@@ -303,12 +303,15 @@ fn main() -> Result<()> {
         Command::Export { out } => {
             let exported = export::write(&store, &out)?;
             println!(
-                "export creado: {} (clients={}, apps={}, db_servers={}, grants={})",
+                "export creado: {} (clients={}, apps={}, db_servers={}, grants={}, ssh_users={}, ssh_keys={}, aliases={})",
                 out.display(),
                 exported.clients.len(),
                 exported.apps.len(),
                 exported.db_servers.len(),
-                exported.database_grants.len()
+                exported.database_grants.len(),
+                exported.ssh_users.len(),
+                exported.ssh_keys.len(),
+                exported.domain_aliases.len(),
             );
         }
         Command::Update { check, force } => {
@@ -318,13 +321,16 @@ fn main() -> Result<()> {
             let imported = export::read(&path)?;
             if dry_run {
                 println!(
-                    "dry-run OK: {} (version={}, clients={}, apps={}, db_servers={}, grants={})",
+                    "dry-run OK: {} (version={}, clients={}, apps={}, db_servers={}, grants={}, ssh_users={}, ssh_keys={}, aliases={})",
                     path.display(),
                     imported.version,
                     imported.clients.len(),
                     imported.apps.len(),
                     imported.db_servers.len(),
-                    imported.database_grants.len()
+                    imported.database_grants.len(),
+                    imported.ssh_users.len(),
+                    imported.ssh_keys.len(),
+                    imported.domain_aliases.len(),
                 );
             } else {
                 if !yes {
@@ -332,8 +338,14 @@ fn main() -> Result<()> {
                 }
                 let summary = export::import(&store, &imported)?;
                 println!(
-                    "import aplicado: clients={}, apps={}, db_servers={}, grants={}",
-                    summary.clients, summary.apps, summary.db_servers, summary.database_grants
+                    "import aplicado: clients={}, apps={}, db_servers={}, grants={}, ssh_users={}, ssh_keys={}, aliases={}",
+                    summary.clients,
+                    summary.apps,
+                    summary.db_servers,
+                    summary.database_grants,
+                    summary.ssh_users,
+                    summary.ssh_keys,
+                    summary.domain_aliases,
                 );
             }
         }

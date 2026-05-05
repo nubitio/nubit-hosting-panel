@@ -76,6 +76,25 @@ pub fn run(cfg: &Config, store: &Store) -> Result<Vec<Check>> {
         }
     }
 
+    // ── SSH checks ──────────────────────────────────────────────────────
+    for user in store.list_ssh_users()? {
+        // ¿Shell existe en el sistema?
+        checks.push(path_exists(
+            &format!("SSH shell {}", user.username),
+            std::path::Path::new(&user.shell),
+        ));
+        // ¿Usuario existe en el sistema?
+        checks.push(system_user_exists(&user.username));
+        // ¿authorized_keys existe?
+        let ak = std::path::Path::new(&user.home_dir)
+            .join(".ssh")
+            .join("authorized_keys");
+        checks.push(path_exists(
+            &format!("SSH authorized_keys {}", user.username),
+            &ak,
+        ));
+    }
+
     Ok(checks)
 }
 
@@ -153,6 +172,22 @@ fn mssql_sqlcmd_check(cfg: &Config, container: &str) -> Check {
                 ),
             }
         }
+    }
+}
+
+fn system_user_exists(username: &str) -> Check {
+    let ok = Command::new("id")
+        .arg(username)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        Check::ok(format!("SSH system user {username}"), "existe")
+    } else {
+        Check::fail(
+            format!("SSH system user {username}"),
+            "no encontrado en el sistema (useradd no se ejecutó o fue eliminado manualmente)",
+        )
     }
 }
 

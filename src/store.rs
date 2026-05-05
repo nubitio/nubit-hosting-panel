@@ -18,6 +18,8 @@ pub struct Client {
     pub slug: String,
     pub name: String,
     pub email: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -28,6 +30,8 @@ pub struct App {
     pub slug: String,
     pub domain: String,
     pub upstream: String,
+    #[serde(default)]
+    pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -156,6 +160,11 @@ const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL
     );
     "#,
+    // v5 — notas opcionales en clientes y apps
+    r#"
+    ALTER TABLE clients ADD COLUMN notes TEXT;
+    ALTER TABLE apps ADD COLUMN notes TEXT;
+    "#,
 ];
 
 impl Store {
@@ -193,6 +202,7 @@ impl Store {
             slug: slug.to_string(),
             name: name.to_string(),
             email: email.map(str::to_string),
+            notes: None,
             created_at: Utc::now(),
         };
         self.conn.execute(
@@ -211,14 +221,15 @@ impl Store {
     pub fn list_clients(&self) -> Result<Vec<Client>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, slug, name, email, created_at FROM clients ORDER BY slug")?;
+            .prepare("SELECT id, slug, name, email, notes, created_at FROM clients ORDER BY slug")?;
         let rows = stmt.query_map([], |row| {
             Ok(Client {
                 id: row.get(0)?,
                 slug: row.get(1)?,
                 name: row.get(2)?,
                 email: row.get(3)?,
-                created_at: parse_dt(row.get::<_, String>(4)?)?,
+                notes: row.get(4)?,
+                created_at: parse_dt(row.get::<_, String>(5)?)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -256,6 +267,7 @@ impl Store {
             slug: slug.to_string(),
             domain: domain.to_string(),
             upstream: upstream.to_string(),
+            notes: None,
             created_at: Utc::now(),
         };
         self.conn.execute(
@@ -267,7 +279,7 @@ impl Store {
 
     pub fn list_apps(&self) -> Result<Vec<App>> {
         let mut stmt = self.conn.prepare(
-            "SELECT a.id, c.slug, a.slug, a.domain, a.upstream, a.created_at FROM apps a JOIN clients c ON c.id = a.client_id ORDER BY c.slug, a.slug",
+            "SELECT a.id, c.slug, a.slug, a.domain, a.upstream, a.notes, a.created_at FROM apps a JOIN clients c ON c.id = a.client_id ORDER BY c.slug, a.slug",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(App {
@@ -276,7 +288,8 @@ impl Store {
                 slug: row.get(2)?,
                 domain: row.get(3)?,
                 upstream: row.get(4)?,
-                created_at: parse_dt(row.get::<_, String>(5)?)?,
+                notes: row.get(5)?,
+                created_at: parse_dt(row.get::<_, String>(6)?)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -358,8 +371,8 @@ impl Store {
     pub fn import_client(&self, client: &Client) -> Result<()> {
         validate_slug(&client.slug)?;
         self.conn.execute(
-            "INSERT OR IGNORE INTO clients (id, slug, name, email, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![client.id, client.slug, client.name, client.email, client.created_at.to_rfc3339()],
+            "INSERT OR IGNORE INTO clients (id, slug, name, email, notes, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![client.id, client.slug, client.name, client.email, client.notes, client.created_at.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -369,8 +382,37 @@ impl Store {
         validate_slug(&app.slug)?;
         let client_id = self.client_id(&app.client_slug)?;
         self.conn.execute(
-            "INSERT OR IGNORE INTO apps (id, client_id, slug, domain, upstream, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![app.id, client_id, app.slug, app.domain, app.upstream, app.created_at.to_rfc3339()],
+            "INSERT OR IGNORE INTO apps (id, client_id, slug, domain, upstream, notes, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![app.id, client_id, app.slug, app.domain, app.upstream, app.notes, app.created_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn import_ssh_user(&self, user: &SshUser) -> Result<()> {
+        let client_id = self.client_id(&user.client_slug)?;
+        let app_id = match &user.app_slug {
+            Some(a) => Some(self.app_id(&user.client_slug, a)?),
+            None => None,
+        };
+        self.conn.execute(
+            "INSERT OR IGNORE INTO ssh_users (id, client_id, app_id, username, shell, home_dir, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![user.id, client_id, app_id, user.username, user.shell, user.home_dir, user.created_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn import_ssh_key(&self, key: &SshKey) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO ssh_keys (id, user_id, label, public_key, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![key.id, key.user_id, key.label, key.public_key, key.created_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn import_domain_alias(&self, alias: &DomainAlias) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO domain_aliases (id, app_id, domain, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![alias.id, alias.app_id, alias.domain, alias.created_at.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -419,11 +461,18 @@ impl Store {
         Ok(())
     }
 
-    pub fn update_client(&self, id: &str, slug: &str, name: &str, email: Option<&str>) -> Result<()> {
+    pub fn update_client(
+        &self,
+        id: &str,
+        slug: &str,
+        name: &str,
+        email: Option<&str>,
+        notes: Option<&str>,
+    ) -> Result<()> {
         validate_slug(slug)?;
         let changed = self.conn.execute(
-            "UPDATE clients SET slug = ?1, name = ?2, email = ?3 WHERE id = ?4",
-            params![slug, name, email, id],
+            "UPDATE clients SET slug = ?1, name = ?2, email = ?3, notes = ?4 WHERE id = ?5",
+            params![slug, name, email, notes, id],
         )?;
         if changed == 0 {
             bail!("cliente no encontrado: {}", id);
@@ -438,13 +487,14 @@ impl Store {
         slug: &str,
         domain: &str,
         upstream: &str,
+        notes: Option<&str>,
     ) -> Result<()> {
         validate_slug(client_slug)?;
         validate_slug(slug)?;
         let client_id = self.client_id(client_slug)?;
         let changed = self.conn.execute(
-            "UPDATE apps SET client_id = ?1, slug = ?2, domain = ?3, upstream = ?4 WHERE id = ?5",
-            params![client_id, slug, domain, upstream, id],
+            "UPDATE apps SET client_id = ?1, slug = ?2, domain = ?3, upstream = ?4, notes = ?5 WHERE id = ?6",
+            params![client_id, slug, domain, upstream, notes, id],
         )?;
         if changed == 0 {
             bail!("app no encontrada: {}", id);

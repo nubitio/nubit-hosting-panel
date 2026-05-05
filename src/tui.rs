@@ -15,6 +15,8 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs},
 };
 
+use std::collections::HashMap;
+
 use crate::{
     backup, caddy,
     config::Config,
@@ -380,6 +382,11 @@ struct TuiState {
     db_focus: DbFocus,
     app_focus: AppFocus,
     ssh_focus: SshFocus,
+    /// app_id → estado del contenedor Docker ("running", "exited", ...)
+    container_status: HashMap<String, String>,
+    /// Query de filtro activo (vacío = sin filtro)
+    filter_query: String,
+    filter_active: bool,
     status: String,
     modal: Modal,
 }
@@ -387,10 +394,10 @@ struct TuiState {
 impl TuiState {
     fn load(store: &Store, cfg: &Config) -> Result<Self> {
         let doctor_checks = doctor::run(cfg, store).unwrap_or_default();
-        Ok(Self {
+        let apps = store.list_apps()?;
+        let mut s = Self {
             tab: ActiveTab::Dashboard,
             clients: store.list_clients()?,
-            apps: store.list_apps()?,
             aliases: store.list_domain_aliases()?,
             db_servers: store.list_db_servers()?,
             grants: store.list_database_grants()?,
@@ -412,9 +419,15 @@ impl TuiState {
             db_focus: DbFocus::Servers,
             app_focus: AppFocus::Apps,
             ssh_focus: SshFocus::Users,
+            container_status: HashMap::new(),
+            filter_query: String::new(),
+            filter_active: false,
             status: String::new(),
             modal: Modal::None,
-        })
+            apps,
+        };
+        s.refresh_container_status();
+        Ok(s)
     }
 
     fn reload(&mut self, store: &Store, cfg: &Config) -> Result<()> {
@@ -430,19 +443,96 @@ impl TuiState {
         self.doctor_loaded = true;
         self.sys_info = load_sys_info();
         self.last_sys_refresh = std::time::Instant::now();
+        self.refresh_container_status();
         Ok(())
     }
 
     fn switch_tab(&mut self, tab: ActiveTab) {
         self.tab = tab;
         self.status.clear();
+        self.filter_query.clear();
+        self.filter_active = false;
+    }
+
+    /// Actualiza el estado de contenedores Docker parseando el upstream de cada app.
+    fn refresh_container_status(&mut self) {
+        self.container_status.clear();
+        for app in &self.apps {
+            let host = app.upstream.split(':').next().unwrap_or("");
+            // Solo intentamos docker inspect si el host no es una IP ni localhost
+            let is_ip = host == "localhost"
+                || host.starts_with("127.")
+                || host.parse::<std::net::IpAddr>().is_ok();
+            if is_ip || host.is_empty() {
+                continue;
+            }
+            if let Ok(out) = std::process::Command::new("docker")
+                .args(["inspect", "--format", "{{.State.Status}}", host])
+                .output()
+            {
+                if out.status.success() {
+                    let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    self.container_status.insert(app.id.clone(), status);
+                }
+            }
+        }
+    }
+
+    // ── Filtered views (aplica filter_query) ─────────────────────────────
+
+    fn filtered_clients(&self) -> Vec<&Client> {
+        let q = self.filter_query.to_lowercase();
+        self.clients
+            .iter()
+            .filter(|c| {
+                q.is_empty()
+                    || c.slug.to_lowercase().contains(&q)
+                    || c.name.to_lowercase().contains(&q)
+                    || c.email.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                    || c.notes.as_deref().unwrap_or("").to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    fn filtered_apps_view(&self) -> Vec<&HostingApp> {
+        let q = self.filter_query.to_lowercase();
+        self.apps
+            .iter()
+            .filter(|a| {
+                q.is_empty()
+                    || a.client_slug.to_lowercase().contains(&q)
+                    || a.slug.to_lowercase().contains(&q)
+                    || a.domain.to_lowercase().contains(&q)
+                    || a.upstream.to_lowercase().contains(&q)
+                    || a.notes.as_deref().unwrap_or("").to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    fn filtered_ssh_users_view(&self) -> Vec<&SshUser> {
+        let q = self.filter_query.to_lowercase();
+        self.ssh_users
+            .iter()
+            .filter(|u| {
+                q.is_empty()
+                    || u.username.to_lowercase().contains(&q)
+                    || u.client_slug.to_lowercase().contains(&q)
+                    || u.app_slug.as_deref().unwrap_or("").to_lowercase().contains(&q)
+            })
+            .collect()
     }
 
     fn nav_down(&mut self) {
         match (self.tab, self.db_focus) {
-            (ActiveTab::Clients, _) => nav_down(&mut self.clients_table, self.clients.len()),
+            (ActiveTab::Clients, _) => {
+                let len = self.filtered_clients().len();
+                nav_down(&mut self.clients_table, len);
+            }
             (ActiveTab::Apps, _) => match self.app_focus {
-                AppFocus::Apps => nav_down(&mut self.apps_table, self.apps.len()),
+                AppFocus::Apps => {
+                    let len = self.filtered_apps_view().len();
+                    nav_down(&mut self.apps_table, len);
+                }
                 AppFocus::Aliases => {
                     let len = self.filtered_aliases().len();
                     nav_down(&mut self.aliases_table, len);
@@ -457,7 +547,10 @@ impl TuiState {
             }
             (ActiveTab::Backups, _) => nav_down(&mut self.backups_table, self.backups.len()),
             (ActiveTab::Ssh, _) => match self.ssh_focus {
-                SshFocus::Users => nav_down(&mut self.ssh_users_table, self.ssh_users.len()),
+                SshFocus::Users => {
+                    let len = self.filtered_ssh_users_view().len();
+                    nav_down(&mut self.ssh_users_table, len);
+                }
                 SshFocus::Keys => {
                     let len = self.filtered_ssh_keys().len();
                     nav_down(&mut self.ssh_keys_table, len);
@@ -469,9 +562,15 @@ impl TuiState {
 
     fn nav_up(&mut self) {
         match (self.tab, self.db_focus) {
-            (ActiveTab::Clients, _) => nav_up(&mut self.clients_table, self.clients.len()),
+            (ActiveTab::Clients, _) => {
+                let len = self.filtered_clients().len();
+                nav_up(&mut self.clients_table, len);
+            }
             (ActiveTab::Apps, _) => match self.app_focus {
-                AppFocus::Apps => nav_up(&mut self.apps_table, self.apps.len()),
+                AppFocus::Apps => {
+                    let len = self.filtered_apps_view().len();
+                    nav_up(&mut self.apps_table, len);
+                }
                 AppFocus::Aliases => {
                     let len = self.filtered_aliases().len();
                     nav_up(&mut self.aliases_table, len);
@@ -486,7 +585,10 @@ impl TuiState {
             }
             (ActiveTab::Backups, _) => nav_up(&mut self.backups_table, self.backups.len()),
             (ActiveTab::Ssh, _) => match self.ssh_focus {
-                SshFocus::Users => nav_up(&mut self.ssh_users_table, self.ssh_users.len()),
+                SshFocus::Users => {
+                    let len = self.filtered_ssh_users_view().len();
+                    nav_up(&mut self.ssh_users_table, len);
+                }
                 SshFocus::Keys => {
                     let len = self.filtered_ssh_keys().len();
                     nav_up(&mut self.ssh_keys_table, len);
@@ -1026,6 +1128,8 @@ impl TuiState {
                             FormField::req("Nombre", "ej: Acme Corp").prefill(&client.name),
                             FormField::opt("Email", "ej: ops@acme.com")
                                 .prefill(&client.email.clone().unwrap_or_default()),
+                            FormField::opt("Notas", "contacto, proveedor, observaciones...")
+                                .prefill(&client.notes.clone().unwrap_or_default()),
                         ],
                         focus: 0,
                         kind: FormKind::EditClient,
@@ -1057,6 +1161,8 @@ impl TuiState {
                                         .prefill(&app.domain),
                                     FormField::req("Upstream", "ej: container:8080")
                                         .prefill(&app.upstream),
+                                    FormField::opt("Notas", "observaciones internas...")
+                                        .prefill(&app.notes.clone().unwrap_or_default()),
                                 ],
                                 focus: 0,
                                 kind: FormKind::EditApp,
@@ -1144,6 +1250,30 @@ fn nav_up(state: &mut TableState, len: usize) {
 
 // ── Event handling ────────────────────────────────────────────────────────────
 
+fn handle_filter_key(state: &mut TuiState, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            state.filter_query.clear();
+            state.filter_active = false;
+            // Reset selecciones para evitar índice fuera de rango
+            state.clients_table.select(None);
+            state.apps_table.select(None);
+            state.ssh_users_table.select(None);
+        }
+        KeyCode::Enter => {
+            // Confirmar filtro pero mantenerlo activo
+            state.filter_active = false;
+        }
+        KeyCode::Backspace => {
+            state.filter_query.pop();
+        }
+        KeyCode::Char(c) => {
+            state.filter_query.push(c);
+        }
+        _ => {}
+    }
+}
+
 fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Config) -> Result<()> {
     match code {
         KeyCode::Tab => {
@@ -1206,6 +1336,11 @@ fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Con
                 ok,
                 fail
             );
+        }
+        KeyCode::Char('/') => {
+            state.filter_query.clear();
+            state.filter_active = true;
+            state.status.clear();
         }
         _ => {}
     }
@@ -1475,12 +1610,9 @@ fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
             }
         }
         FormKind::EditClient => {
-            let email = if data[2].is_empty() {
-                None
-            } else {
-                Some(data[2].as_str())
-            };
-            match store.update_client(&payload, &data[0], &data[1], email) {
+            let email = if data[2].is_empty() { None } else { Some(data[2].as_str()) };
+            let notes = if data[3].is_empty() { None } else { Some(data[3].as_str()) };
+            match store.update_client(&payload, &data[0], &data[1], email, notes) {
                 Ok(()) => {
                     state.modal = Modal::None;
                     state.reload(store, cfg)?;
@@ -1491,7 +1623,8 @@ fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
             }
         }
         FormKind::EditApp => {
-            match store.update_app(&payload, &data[0], &data[1], &data[2], &data[3]) {
+            let notes = if data[4].is_empty() { None } else { Some(data[4].as_str()) };
+            match store.update_app(&payload, &data[0], &data[1], &data[2], &data[3], notes) {
                 Ok(()) => {
                     state.modal = Modal::None;
                     state.reload(store, cfg)?;
@@ -1757,18 +1890,27 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
 
         if event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-                    if matches!(state.modal, Modal::None) {
-                        break Ok(());
-                    }
+                // q/Esc solo sale si no hay modal ni filtro activo
+                if (key.code == KeyCode::Char('q') || key.code == KeyCode::Esc)
+                    && matches!(state.modal, Modal::None)
+                    && !state.filter_active
+                {
+                    break Ok(());
                 }
-                let result = match &state.modal {
-                    Modal::None => handle_main_key(&mut state, key.code, store, cfg),
-                    Modal::Form { .. } => handle_form_key(&mut state, key.code, store, cfg),
-                    Modal::Confirm { .. } => handle_confirm_key(&mut state, key.code, store, cfg),
-                    Modal::Result { .. } => {
-                        handle_result_key(&mut state, key.code);
-                        Ok(())
+                let result = if state.filter_active && matches!(state.modal, Modal::None) {
+                    handle_filter_key(&mut state, key.code);
+                    Ok(())
+                } else {
+                    match &state.modal {
+                        Modal::None => handle_main_key(&mut state, key.code, store, cfg),
+                        Modal::Form { .. } => handle_form_key(&mut state, key.code, store, cfg),
+                        Modal::Confirm { .. } => {
+                            handle_confirm_key(&mut state, key.code, store, cfg)
+                        }
+                        Modal::Result { .. } => {
+                            handle_result_key(&mut state, key.code);
+                            Ok(())
+                        }
                     }
                 };
                 if let Err(e) = result {
@@ -1846,33 +1988,47 @@ fn draw_tabs(frame: &mut Frame, state: &TuiState, area: Rect) {
 }
 
 fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
-    let msg = if !state.status.is_empty() {
-        state.status.clone()
+    let (msg, style) = if state.filter_active {
+        (
+            format!("  / filtrar: {}▌   Enter: confirmar   Esc: limpiar", state.filter_query),
+            Style::default().fg(Color::Cyan),
+        )
+    } else if !state.filter_query.is_empty() {
+        (
+            format!(
+                "  Filtro activo: '{}'   / para cambiar   Esc para limpiar   {}",
+                state.filter_query,
+                match state.tab {
+                    ActiveTab::Clients => "↑↓: nav   a/e/d   q: quit",
+                    ActiveTab::Apps => "↑↓: nav   a/e/d   Tab: aliases   q: quit",
+                    _ => "↑↓: nav   q: quit",
+                }
+            ),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if !state.status.is_empty() {
+        (state.status.clone(), Style::default().fg(Color::DarkGray))
     } else {
-        match state.tab {
-            ActiveTab::Clients => "  1-6: tab   ↑↓: nav   a: add   e: edit   d: delete   r: refresh   q: quit".to_string(),
+        let hint = match state.tab {
+            ActiveTab::Clients => "  1-6: tab   ↑↓: nav   a: add   e: edit   d: delete   /: filtrar   r: refresh   q: quit",
             ActiveTab::Apps => match state.app_focus {
-                AppFocus::Apps    => "  Tab: foco aliases   ↑↓: nav   a: add app   e: edit   d: delete   c: caddy   r: refresh   q: quit".to_string(),
-                AppFocus::Aliases => "  Tab: foco apps   ↑↓: nav   a: add alias   d: delete alias   c: caddy   r: refresh   q: quit".to_string(),
+                AppFocus::Apps    => "  Tab: aliases   ↑↓: nav   a: add   e: edit   d: delete   /: filtrar   c: caddy   r: refresh   q: quit",
+                AppFocus::Aliases => "  Tab: apps   ↑↓: nav   a: add alias   d: delete alias   c: caddy   r: refresh   q: quit",
             },
             ActiveTab::Databases => match state.db_focus {
-                DbFocus::Servers => "  Tab: foco grants   ↑↓: nav   a: add server   p: provisionar   r: refresh   q: quit".to_string(),
-                DbFocus::Grants  => "  Tab: foco servers   ↑↓: nav   e: reset password   r: refresh   q: quit".to_string(),
+                DbFocus::Servers => "  Tab: foco grants   ↑↓: nav   a: add server   p: provisionar   r: refresh   q: quit",
+                DbFocus::Grants  => "  Tab: foco servers   ↑↓: nav   e: reset password   r: refresh   q: quit",
             },
-            ActiveTab::Backups =>
-                "  1-6: tab   ↑↓: nav   a: nuevo backup   Enter: restaurar   r: refresh   q: quit".to_string(),
-            ActiveTab::Dashboard =>
-                "  1-6: tab   r: refresh   q: quit".to_string(),
+            ActiveTab::Backups     => "  1-6: tab   ↑↓: nav   a: nuevo backup   Enter: restaurar   r: refresh   q: quit",
+            ActiveTab::Dashboard   => "  1-6: tab   r: refresh   q: quit",
             ActiveTab::Ssh => match state.ssh_focus {
-                SshFocus::Users => "  Tab: foco claves   ↑↓: nav   a: add user   e: edit   d: delete   r: refresh   q: quit".to_string(),
-                SshFocus::Keys  => "  Tab: foco users   ↑↓: nav   a: add clave   d: delete clave   r: refresh   q: quit".to_string(),
+                SshFocus::Users => "  Tab: claves   ↑↓: nav   a: add user   e: edit   d: delete   /: filtrar   r: refresh   q: quit",
+                SshFocus::Keys  => "  Tab: users   ↑↓: nav   a: add clave   d: delete clave   r: refresh   q: quit",
             },
-        }
+        };
+        (hint.to_string(), Style::default().fg(Color::DarkGray))
     };
-    frame.render_widget(
-        Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(msg).style(style), area);
 }
 
 fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
@@ -2023,21 +2179,33 @@ fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
 }
 
 fn draw_clients(frame: &mut Frame, state: &mut TuiState, area: Rect) {
-    let header = Row::new(vec!["Slug", "Name", "Email", "Created"])
+    let clients = state.filtered_clients();
+    let filter_indicator = if !state.filter_query.is_empty() {
+        format!(" [{}/{}]", clients.len(), state.clients.len())
+    } else {
+        String::new()
+    };
+    let header = Row::new(vec!["Slug", "Name", "Email", "Notas", "Created"])
         .style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
         .height(1);
-    let rows: Vec<Row> = state
-        .clients
+    let rows: Vec<Row> = clients
         .iter()
         .map(|c| {
+            let notes_preview = c.notes.as_deref().unwrap_or("");
+            let notes_display = if notes_preview.len() > 22 {
+                format!("{}…", &notes_preview[..21])
+            } else {
+                notes_preview.to_string()
+            };
             Row::new(vec![
                 Cell::from(c.slug.clone()),
                 Cell::from(c.name.clone()),
                 Cell::from(c.email.clone().unwrap_or_default()),
+                Cell::from(notes_display).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(c.created_at.format("%Y-%m-%d").to_string()),
             ])
         })
@@ -2045,17 +2213,18 @@ fn draw_clients(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     let table = Table::new(
         rows,
         [
+            Constraint::Percentage(18),
+            Constraint::Percentage(28),
+            Constraint::Percentage(25),
             Constraint::Percentage(20),
-            Constraint::Percentage(35),
-            Constraint::Percentage(30),
-            Constraint::Percentage(15),
+            Constraint::Percentage(9),
         ],
     )
     .header(header)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Clients ({}) ", state.clients.len())),
+            .title(format!(" Clients ({}){}  / para filtrar ", state.clients.len(), filter_indicator)),
     )
     .row_highlight_style(
         Style::default()
@@ -2075,16 +2244,17 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     let focused_style = Style::default().fg(Color::Cyan);
     let normal_style = Style::default().fg(Color::DarkGray);
 
-    // ── Panel apps ──────────────────────────────────────────────────
-    let header = Row::new(vec!["Client", "App", "Domain", "Upstream", "Created"])
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
+    // ── Panel apps ────────────────────────────────────────────────
+    let filtered_apps = state.filtered_apps_view();
+    let filter_indicator = if !state.filter_query.is_empty() {
+        format!(" [{}/{}]", filtered_apps.len(), state.apps.len())
+    } else {
+        String::new()
+    };
+    let header = Row::new(vec!["", "Client", "App", "Domain", "Upstream", "Created"])
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
         .height(1);
-    let rows: Vec<Row> = state
-        .apps
+    let rows: Vec<Row> = filtered_apps
         .iter()
         .map(|a| {
             let alias_count = state.aliases.iter().filter(|al| al.app_id == a.id).count();
@@ -2093,7 +2263,15 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             } else {
                 a.domain.clone()
             };
+            let (status_sym, status_color) =
+                match state.container_status.get(&a.id).map(String::as_str) {
+                    Some("running") => ("▲", Color::Green),
+                    Some("exited") | Some("dead") => ("▼", Color::Red),
+                    Some(_) => ("●", Color::Yellow),
+                    None => (" ", Color::DarkGray),
+                };
             Row::new(vec![
+                Cell::from(status_sym).style(Style::default().fg(status_color)),
                 Cell::from(a.client_slug.clone()),
                 Cell::from(a.slug.clone()),
                 Cell::from(domain_cell),
@@ -2103,17 +2281,21 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         })
         .collect();
     let apps_title = if apps_focused {
-        format!(" Apps ({}) ● — a: add  e: edit  d: delete  Tab: aliases ", state.apps.len())
+        format!(
+            " Apps ({}){}  ● — a: add  e: edit  d: delete  Tab: aliases ",
+            state.apps.len(), filter_indicator
+        )
     } else {
-        format!(" Apps ({}) — Tab: focus ", state.apps.len())
+        format!(" Apps ({}){}  — Tab: focus  /: filtrar ", state.apps.len(), filter_indicator)
     };
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(15),
-            Constraint::Percentage(12),
-            Constraint::Percentage(35),
-            Constraint::Percentage(28),
+            Constraint::Percentage(3),
+            Constraint::Percentage(13),
+            Constraint::Percentage(11),
+            Constraint::Percentage(33),
+            Constraint::Percentage(27),
             Constraint::Percentage(10),
         ],
     )
@@ -2124,11 +2306,7 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             .title(apps_title)
             .border_style(if apps_focused { focused_style } else { normal_style }),
     )
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
+    .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
     frame.render_stateful_widget(table, chunks[0], &mut state.apps_table);
 
     // ── Panel aliases ──────────────────────────────────────────────
@@ -2141,23 +2319,17 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     let aliases_title = match (&selected_app_name, aliases_focused) {
         (Some(name), true) => format!(
             " Dominios Alias ● {} ({}) — a: add  d: delete ",
-            name,
-            filtered_aliases.len()
+            name, filtered_aliases.len()
         ),
         (Some(name), false) => format!(
             " Dominios Alias {} ({}) — Tab: focus ",
-            name,
-            filtered_aliases.len()
+            name, filtered_aliases.len()
         ),
         (None, _) => " Dominios Alias — selecciona una app ↑↓ ".to_string(),
     };
 
     let alias_header = Row::new(vec!["Dominio Alias", "Agregado"])
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
         .height(1);
     let alias_rows: Vec<Row> = filtered_aliases
         .iter()
@@ -2179,11 +2351,7 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             .title(aliases_title)
             .border_style(if aliases_focused { focused_style } else { normal_style }),
     )
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
+    .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
     frame.render_stateful_widget(aliases_table, chunks[1], &mut state.aliases_table);
 }
 
