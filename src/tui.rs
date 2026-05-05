@@ -18,8 +18,8 @@ use ratatui::{
 use crate::{
     backup, caddy,
     config::Config,
-    db, doctor,
-    store::{App as HostingApp, Client, DatabaseGrant, DbServer, Store},
+    db, doctor, ssh,
+    store::{App as HostingApp, Client, DatabaseGrant, DbServer, DomainAlias, SshKey, SshUser, Store},
 };
 
 // ── System info ───────────────────────────────────────────────────────────────
@@ -115,6 +115,7 @@ enum ActiveTab {
     Apps,
     Databases,
     Backups,
+    Ssh,
 }
 
 impl ActiveTab {
@@ -125,6 +126,7 @@ impl ActiveTab {
             Self::Apps => 2,
             Self::Databases => 3,
             Self::Backups => 4,
+            Self::Ssh => 5,
         }
     }
     fn from_index(i: usize) -> Self {
@@ -133,15 +135,34 @@ impl ActiveTab {
             2 => Self::Apps,
             3 => Self::Databases,
             4 => Self::Backups,
+            5 => Self::Ssh,
             _ => Self::Dashboard,
         }
     }
     fn next(self) -> Self {
-        Self::from_index((self.index() + 1) % 5)
+        Self::from_index((self.index() + 1) % 6)
     }
     fn prev(self) -> Self {
-        Self::from_index((self.index() + 4) % 5)
+        Self::from_index((self.index() + 5) % 6)
     }
+}
+
+// ── SSH tab focus ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SshFocus {
+    #[default]
+    Users,
+    Keys,
+}
+
+// ── Apps tab focus ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum AppFocus {
+    #[default]
+    Apps,
+    Aliases,
 }
 
 // ── DB tab focus ──────────────────────────────────────────────────────────────
@@ -246,6 +267,12 @@ enum FormKind {
     Provision,
     Backup,
     ResetPassword,
+    EditClient,
+    EditApp,
+    AddSshUser,
+    AddSshKey,
+    EditSshUser,
+    AddAlias,
 }
 
 #[derive(Clone, Copy)]
@@ -254,6 +281,9 @@ enum ConfirmKind {
     DeleteApp,
     RestoreBackup,
     CaddyApply,
+    DeleteSshUser,
+    DeleteSshKey,
+    DeleteAlias,
 }
 
 enum Modal {
@@ -264,6 +294,8 @@ enum Modal {
         focus: usize,
         kind: FormKind,
         error: Option<String>,
+        /// ID de la entidad al editar (vacío al crear)
+        payload: String,
     },
     Confirm {
         message: String,
@@ -327,19 +359,27 @@ struct TuiState {
     tab: ActiveTab,
     clients: Vec<Client>,
     apps: Vec<HostingApp>,
+    aliases: Vec<DomainAlias>,
     db_servers: Vec<DbServer>,
     grants: Vec<DatabaseGrant>,
     backups: Vec<BackupEntry>,
+    ssh_users: Vec<SshUser>,
+    ssh_keys: Vec<SshKey>,
     doctor_checks: Vec<doctor::Check>,
     doctor_loaded: bool,
     sys_info: SysInfo,
     last_sys_refresh: std::time::Instant,
     clients_table: TableState,
     apps_table: TableState,
+    aliases_table: TableState,
     db_table: TableState,
     grants_table: TableState,
     backups_table: TableState,
+    ssh_users_table: TableState,
+    ssh_keys_table: TableState,
     db_focus: DbFocus,
+    app_focus: AppFocus,
+    ssh_focus: SshFocus,
     status: String,
     modal: Modal,
 }
@@ -351,19 +391,27 @@ impl TuiState {
             tab: ActiveTab::Dashboard,
             clients: store.list_clients()?,
             apps: store.list_apps()?,
+            aliases: store.list_domain_aliases()?,
             db_servers: store.list_db_servers()?,
             grants: store.list_database_grants()?,
             backups: scan_backups(&cfg.backup_dir),
+            ssh_users: store.list_ssh_users()?,
+            ssh_keys: store.list_ssh_keys()?,
             doctor_checks,
             doctor_loaded: true,
             sys_info: load_sys_info(),
             last_sys_refresh: std::time::Instant::now(),
             clients_table: TableState::default(),
             apps_table: TableState::default(),
+            aliases_table: TableState::default(),
             db_table: TableState::default(),
             grants_table: TableState::default(),
             backups_table: TableState::default(),
+            ssh_users_table: TableState::default(),
+            ssh_keys_table: TableState::default(),
             db_focus: DbFocus::Servers,
+            app_focus: AppFocus::Apps,
+            ssh_focus: SshFocus::Users,
             status: String::new(),
             modal: Modal::None,
         })
@@ -372,9 +420,12 @@ impl TuiState {
     fn reload(&mut self, store: &Store, cfg: &Config) -> Result<()> {
         self.clients = store.list_clients()?;
         self.apps = store.list_apps()?;
+        self.aliases = store.list_domain_aliases()?;
         self.db_servers = store.list_db_servers()?;
         self.grants = store.list_database_grants()?;
         self.backups = scan_backups(&cfg.backup_dir);
+        self.ssh_users = store.list_ssh_users()?;
+        self.ssh_keys = store.list_ssh_keys()?;
         self.doctor_checks = doctor::run(cfg, store).unwrap_or_default();
         self.doctor_loaded = true;
         self.sys_info = load_sys_info();
@@ -390,7 +441,13 @@ impl TuiState {
     fn nav_down(&mut self) {
         match (self.tab, self.db_focus) {
             (ActiveTab::Clients, _) => nav_down(&mut self.clients_table, self.clients.len()),
-            (ActiveTab::Apps, _) => nav_down(&mut self.apps_table, self.apps.len()),
+            (ActiveTab::Apps, _) => match self.app_focus {
+                AppFocus::Apps => nav_down(&mut self.apps_table, self.apps.len()),
+                AppFocus::Aliases => {
+                    let len = self.filtered_aliases().len();
+                    nav_down(&mut self.aliases_table, len);
+                }
+            },
             (ActiveTab::Databases, DbFocus::Servers) => {
                 nav_down(&mut self.db_table, self.db_servers.len())
             }
@@ -399,6 +456,13 @@ impl TuiState {
                 nav_down(&mut self.grants_table, len);
             }
             (ActiveTab::Backups, _) => nav_down(&mut self.backups_table, self.backups.len()),
+            (ActiveTab::Ssh, _) => match self.ssh_focus {
+                SshFocus::Users => nav_down(&mut self.ssh_users_table, self.ssh_users.len()),
+                SshFocus::Keys => {
+                    let len = self.filtered_ssh_keys().len();
+                    nav_down(&mut self.ssh_keys_table, len);
+                }
+            },
             _ => {}
         }
     }
@@ -406,7 +470,13 @@ impl TuiState {
     fn nav_up(&mut self) {
         match (self.tab, self.db_focus) {
             (ActiveTab::Clients, _) => nav_up(&mut self.clients_table, self.clients.len()),
-            (ActiveTab::Apps, _) => nav_up(&mut self.apps_table, self.apps.len()),
+            (ActiveTab::Apps, _) => match self.app_focus {
+                AppFocus::Apps => nav_up(&mut self.apps_table, self.apps.len()),
+                AppFocus::Aliases => {
+                    let len = self.filtered_aliases().len();
+                    nav_up(&mut self.aliases_table, len);
+                }
+            },
             (ActiveTab::Databases, DbFocus::Servers) => {
                 nav_up(&mut self.db_table, self.db_servers.len())
             }
@@ -415,6 +485,13 @@ impl TuiState {
                 nav_up(&mut self.grants_table, len);
             }
             (ActiveTab::Backups, _) => nav_up(&mut self.backups_table, self.backups.len()),
+            (ActiveTab::Ssh, _) => match self.ssh_focus {
+                SshFocus::Users => nav_up(&mut self.ssh_users_table, self.ssh_users.len()),
+                SshFocus::Keys => {
+                    let len = self.filtered_ssh_keys().len();
+                    nav_up(&mut self.ssh_keys_table, len);
+                }
+            },
             _ => {}
         }
     }
@@ -436,6 +513,52 @@ impl TuiState {
             .collect()
     }
 
+    fn filtered_ssh_keys(&self) -> Vec<&SshKey> {
+        let selected_user_id = self
+            .ssh_users_table
+            .selected()
+            .and_then(|i| self.ssh_users.get(i))
+            .map(|u| u.id.clone());
+        self.ssh_keys
+            .iter()
+            .filter(|k| {
+                selected_user_id
+                    .as_deref()
+                    .map(|id| k.user_id == id)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    fn selected_ssh_user(&self) -> Option<&SshUser> {
+        self.ssh_users_table
+            .selected()
+            .and_then(|i| self.ssh_users.get(i))
+    }
+
+    fn filtered_aliases(&self) -> Vec<&DomainAlias> {
+        let selected_app_id = self
+            .apps_table
+            .selected()
+            .and_then(|i| self.apps.get(i))
+            .map(|a| a.id.clone());
+        self.aliases
+            .iter()
+            .filter(|al| {
+                selected_app_id
+                    .as_deref()
+                    .map(|id| al.app_id == id)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    fn selected_app(&self) -> Option<&HostingApp> {
+        self.apps_table
+            .selected()
+            .and_then(|i| self.apps.get(i))
+    }
+
     fn selected_server(&self) -> Option<&DbServer> {
         self.db_table
             .selected()
@@ -448,6 +571,18 @@ impl TuiState {
 
     fn client_options(&self) -> Vec<String> {
         self.clients.iter().map(|c| c.slug.clone()).collect()
+    }
+
+    /// Opciones de app para un cliente: "(ninguna)" + slugs filtrados.
+    fn app_options_for_client(&self, client_slug: &str) -> Vec<String> {
+        let mut opts = vec!["(ninguna)".to_string()];
+        opts.extend(
+            self.apps
+                .iter()
+                .filter(|a| a.client_slug == client_slug)
+                .map(|a| a.slug.clone()),
+        );
+        opts
     }
 
     fn open_add(&mut self) {
@@ -476,6 +611,7 @@ impl TuiState {
                     focus: 0,
                     kind: FormKind::AddClient,
                     error: None,
+                    payload: String::new(),
                 };
             }
             ActiveTab::Apps => {
@@ -484,26 +620,53 @@ impl TuiState {
                 } else {
                     prefill_client
                 };
-                let mut client_field = if client_opts.is_empty() {
-                    FormField::req("Cliente (slug)", "ej: acme-corp")
-                } else {
-                    FormField::select("Cliente", client_opts)
-                };
-                if !prefill.is_empty() {
-                    client_field = client_field.prefill(&prefill);
+                match self.app_focus {
+                    AppFocus::Apps => {
+                        let mut client_field = if client_opts.is_empty() {
+                            FormField::req("Cliente (slug)", "ej: acme-corp")
+                        } else {
+                            FormField::select("Cliente", client_opts)
+                        };
+                        if !prefill.is_empty() {
+                            client_field = client_field.prefill(&prefill);
+                        }
+                        self.modal = Modal::Form {
+                            title: " Agregar App ",
+                            fields: vec![
+                                client_field,
+                                FormField::req("App slug", "ej: web"),
+                                FormField::req("Dominio", "ej: acme.nubit.site"),
+                                FormField::req("Upstream", "ej: container:8080"),
+                            ],
+                            focus: 0,
+                            kind: FormKind::AddApp,
+                            error: None,
+                            payload: String::new(),
+                        };
+                    }
+                    AppFocus::Aliases => {
+                        if let Some(app) = self.selected_app() {
+                            let app_id = app.id.clone();
+                            let app_name = format!("{}/{}", app.client_slug, app.slug);
+                            self.modal = Modal::Form {
+                                title: " Agregar Dominio Alias ",
+                                fields: vec![FormField::req(
+                                    "Dominio",
+                                    "ej: marriott.tttracking.com",
+                                )],
+                                focus: 0,
+                                kind: FormKind::AddAlias,
+                                error: None,
+                                payload: app_id,
+                            };
+                            self.status =
+                                format!("agregando alias para {app_name}");
+                        } else {
+                            self.status =
+                                "Selecciona una app primero (↑↓ en panel superior)".to_string();
+                        }
+                    }
                 }
-                self.modal = Modal::Form {
-                    title: " Agregar App ",
-                    fields: vec![
-                        client_field,
-                        FormField::req("App slug", "ej: web"),
-                        FormField::req("Dominio", "ej: acme.nubit.site"),
-                        FormField::req("Upstream", "ej: container:8080"),
-                    ],
-                    focus: 0,
-                    kind: FormKind::AddApp,
-                    error: None,
-                };
             }
             ActiveTab::Databases => {
                 self.modal = Modal::Form {
@@ -517,6 +680,7 @@ impl TuiState {
                     focus: 0,
                     kind: FormKind::AddDbServer,
                     error: None,
+                    payload: String::new(),
                 };
             }
             ActiveTab::Backups => {
@@ -538,7 +702,63 @@ impl TuiState {
                     focus: 0,
                     kind: FormKind::Backup,
                     error: None,
+                    payload: String::new(),
                 };
+            }
+            ActiveTab::Ssh => {
+                let shell_opts = ssh::SHELLS.iter().map(|s| s.to_string()).collect();
+                match self.ssh_focus {
+                    SshFocus::Users => {
+                        let mut client_field = if client_opts.is_empty() {
+                            FormField::req("Cliente", "ej: acme-corp")
+                        } else {
+                            FormField::select("Cliente", client_opts.clone())
+                        };
+                        if !prefill_client.is_empty() {
+                            client_field = client_field.prefill(&prefill_client);
+                        }
+                        let app_opts = self.app_options_for_client(
+                            if prefill_client.is_empty() {
+                                client_opts.first().map(String::as_str).unwrap_or("")
+                            } else {
+                                &prefill_client
+                            },
+                        );
+                        self.modal = Modal::Form {
+                            title: " Agregar Usuario SSH ",
+                            fields: vec![
+                                client_field,
+                                FormField::req("Username", "ej: acme-deploy"),
+                                FormField::select("Shell", shell_opts),
+                                FormField::opt("Home Dir", "vacío = /home/{username}"),
+                                FormField::select("App (opcional)", app_opts),
+                            ],
+                            focus: 0,
+                            kind: FormKind::AddSshUser,
+                            error: None,
+                            payload: String::new(),
+                        };
+                    }
+                    SshFocus::Keys => {
+                        if let Some(user) = self.selected_ssh_user() {
+                            let user_id = user.id.clone();
+                            self.modal = Modal::Form {
+                                title: " Agregar Clave SSH ",
+                                fields: vec![
+                                    FormField::req("Etiqueta", "ej: laptop, trabajo"),
+                                    FormField::req("Clave pública", "ssh-ed25519 AAAA..."),
+                                ],
+                                focus: 0,
+                                kind: FormKind::AddSshKey,
+                                error: None,
+                                payload: user_id,
+                            };
+                        } else {
+                            self.status =
+                                "Selecciona un usuario primero (↑↓ en panel superior)".to_string();
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -582,6 +802,7 @@ impl TuiState {
             focus: 0,
             kind: FormKind::Provision,
             error: None,
+            payload: String::new(),
         };
     }
 
@@ -610,6 +831,7 @@ impl TuiState {
                 focus: 0,
                 kind: FormKind::ResetPassword,
                 error: None,
+                payload: String::new(),
             };
         } else {
             self.status = "Selecciona un grant en la tabla inferior primero".to_string();
@@ -655,12 +877,205 @@ impl TuiState {
                 }
             }
             ActiveTab::Apps => {
-                if let Some(app) = self.apps_table.selected().and_then(|i| self.apps.get(i)) {
-                    self.modal = Modal::Confirm {
-                        message: format!("Eliminar app '{}/{}'?", app.client_slug, app.slug),
-                        kind: ConfirmKind::DeleteApp,
-                        payload: app.id.clone(),
+                match self.app_focus {
+                    AppFocus::Apps => {
+                        if let Some(app) =
+                            self.apps_table.selected().and_then(|i| self.apps.get(i))
+                        {
+                            let alias_count =
+                                self.aliases.iter().filter(|al| al.app_id == app.id).count();
+                            let alias_note = if alias_count > 0 {
+                                format!(" ({alias_count} alias también serán eliminados)")
+                            } else {
+                                String::new()
+                            };
+                            self.modal = Modal::Confirm {
+                                message: format!(
+                                    "Eliminar app '{}/{}'?{}",
+                                    app.client_slug, app.slug, alias_note
+                                ),
+                                kind: ConfirmKind::DeleteApp,
+                                payload: app.id.clone(),
+                            };
+                        }
+                    }
+                    AppFocus::Aliases => {
+                        let aliases = self.filtered_aliases();
+                        if let Some(alias) = self
+                            .aliases_table
+                            .selected()
+                            .and_then(|i| aliases.get(i))
+                            .copied()
+                        {
+                            let app_name = self
+                                .selected_app()
+                                .map(|a| format!("{}/{}", a.client_slug, a.slug))
+                                .unwrap_or_default();
+                            self.modal = Modal::Confirm {
+                                message: format!(
+                                    "Eliminar alias '{}' de '{}'?",
+                                    alias.domain, app_name
+                                ),
+                                kind: ConfirmKind::DeleteAlias,
+                                payload: alias.id.clone(),
+                            };
+                        } else {
+                            self.status = "Selecciona un alias primero (↑↓)".to_string();
+                        }
+                    }
+                }
+            }
+            ActiveTab::Ssh => match self.ssh_focus {
+                SshFocus::Users => {
+                    if let Some(user) = self.selected_ssh_user() {
+                        self.modal = Modal::Confirm {
+                            message: format!(
+                                "Eliminar usuario SSH '{}'?\nSe eliminarán sus claves del panel.\nEl home dir ({}) se conserva.\n\nEsto ejecuta userdel en el sistema.",
+                                user.username, user.home_dir
+                            ),
+                            kind: ConfirmKind::DeleteSshUser,
+                            payload: user.id.clone(),
+                        };
+                    } else {
+                        self.status = "Selecciona un usuario primero (↑↓)".to_string();
+                    }
+                }
+                SshFocus::Keys => {
+                    let keys = self.filtered_ssh_keys();
+                    if let Some(key) = self
+                        .ssh_keys_table
+                        .selected()
+                        .and_then(|i| keys.get(i))
+                        .copied()
+                    {
+                        let user_name = self
+                            .selected_ssh_user()
+                            .map(|u| u.username.as_str())
+                            .unwrap_or("?");
+                        self.modal = Modal::Confirm {
+                            message: format!(
+                                "Eliminar clave '{}' de '{}'?",
+                                key.label, user_name
+                            ),
+                            kind: ConfirmKind::DeleteSshKey,
+                            payload: key.id.clone(),
+                        };
+                    } else {
+                        self.status = "Selecciona una clave primero (↑↓)".to_string();
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    fn open_edit(&mut self) {
+        let client_opts = self.client_options();
+        match self.tab {
+            ActiveTab::Clients => {
+                if let Some(client) = self
+                    .clients_table
+                    .selected()
+                    .and_then(|i| self.clients.get(i))
+                {
+                    let id = client.id.clone();
+                    self.modal = Modal::Form {
+                        title: " Editar Cliente ",
+                        fields: vec![
+                            FormField::req("Slug", "ej: acme-corp").prefill(&client.slug),
+                            FormField::req("Nombre", "ej: Acme Corp").prefill(&client.name),
+                            FormField::opt("Email", "ej: ops@acme.com")
+                                .prefill(&client.email.clone().unwrap_or_default()),
+                        ],
+                        focus: 0,
+                        kind: FormKind::EditClient,
+                        error: None,
+                        payload: id,
                     };
+                } else {
+                    self.status = "Selecciona un cliente primero (↑↓)".to_string();
+                }
+            }
+            ActiveTab::Apps => {
+                match self.app_focus {
+                    AppFocus::Apps => {
+                        if let Some(app) = self.apps_table.selected().and_then(|i| self.apps.get(i)) {
+                            let id = app.id.clone();
+                            let current_client = app.client_slug.clone();
+                            let mut client_field = if client_opts.is_empty() {
+                                FormField::req("Cliente (slug)", "ej: acme-corp")
+                            } else {
+                                FormField::select("Cliente", client_opts)
+                            };
+                            client_field = client_field.prefill(&current_client);
+                            self.modal = Modal::Form {
+                                title: " Editar App ",
+                                fields: vec![
+                                    client_field,
+                                    FormField::req("App slug", "ej: web").prefill(&app.slug),
+                                    FormField::req("Dominio", "ej: acme.nubit.site")
+                                        .prefill(&app.domain),
+                                    FormField::req("Upstream", "ej: container:8080")
+                                        .prefill(&app.upstream),
+                                ],
+                                focus: 0,
+                                kind: FormKind::EditApp,
+                                error: None,
+                                payload: id,
+                            };
+                        } else {
+                            self.status = "Selecciona una app primero (↑↓)".to_string();
+                        }
+                    }
+                    AppFocus::Aliases => {
+                        self.status =
+                            "Los alias no se editan — elimínalo y agrega uno nuevo (d / a)"
+                                .to_string();
+                    }
+                }
+            }
+            ActiveTab::Ssh => {
+                match self.ssh_focus {
+                    SshFocus::Users => {
+                        if let Some(user) = self.selected_ssh_user() {
+                            let id = user.id.clone();
+                            let current_client = user.client_slug.clone();
+                            let current_app = user.app_slug.clone();
+                            let shell_opts =
+                                ssh::SHELLS.iter().map(|s| s.to_string()).collect();
+                            let mut client_field = if client_opts.is_empty() {
+                                FormField::req("Cliente", "ej: acme-corp")
+                            } else {
+                                FormField::select("Cliente", client_opts)
+                            };
+                            client_field = client_field.prefill(&current_client);
+                            let app_opts = self.app_options_for_client(&current_client);
+                            let mut app_field =
+                                FormField::select("App (opcional)", app_opts);
+                            if let Some(ref a) = current_app {
+                                app_field = app_field.prefill(a);
+                            }
+                            self.modal = Modal::Form {
+                                title: " Editar Usuario SSH ",
+                                fields: vec![
+                                    client_field,
+                                    FormField::select("Shell", shell_opts)
+                                        .prefill(&user.shell),
+                                    app_field,
+                                ],
+                                focus: 0,
+                                kind: FormKind::EditSshUser,
+                                error: None,
+                                payload: id,
+                            };
+                        } else {
+                            self.status = "Selecciona un usuario primero (↑↓)".to_string();
+                        }
+                    }
+                    SshFocus::Keys => {
+                        self.status =
+                            "Las claves no se editan — elimínala y agrega una nueva".to_string();
+                    }
                 }
             }
             _ => {}
@@ -697,6 +1112,16 @@ fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Con
                     DbFocus::Servers => DbFocus::Grants,
                     DbFocus::Grants => DbFocus::Servers,
                 };
+            } else if state.tab == ActiveTab::Apps {
+                state.app_focus = match state.app_focus {
+                    AppFocus::Apps => AppFocus::Aliases,
+                    AppFocus::Aliases => AppFocus::Apps,
+                };
+            } else if state.tab == ActiveTab::Ssh {
+                state.ssh_focus = match state.ssh_focus {
+                    SshFocus::Users => SshFocus::Keys,
+                    SshFocus::Keys => SshFocus::Users,
+                };
             } else {
                 state.switch_tab(state.tab.next());
             }
@@ -707,10 +1132,17 @@ fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Con
         KeyCode::Char('3') => state.switch_tab(ActiveTab::Apps),
         KeyCode::Char('4') => state.switch_tab(ActiveTab::Databases),
         KeyCode::Char('5') => state.switch_tab(ActiveTab::Backups),
+        KeyCode::Char('6') => state.switch_tab(ActiveTab::Ssh),
         KeyCode::Down | KeyCode::Char('j') => state.nav_down(),
         KeyCode::Up | KeyCode::Char('k') => state.nav_up(),
         KeyCode::Char('a') => state.open_add(),
         KeyCode::Char('d') => state.open_delete(),
+        KeyCode::Char('e')
+            if state.tab == ActiveTab::Apps || state.tab == ActiveTab::Clients =>
+        {
+            state.open_edit()
+        }
+        KeyCode::Char('e') if state.tab == ActiveTab::Databases => state.open_reset_password(),
         KeyCode::Char('c') if state.tab == ActiveTab::Apps || state.tab == ActiveTab::Dashboard => {
             state.modal = Modal::Confirm {
                 message: format!(
@@ -722,7 +1154,6 @@ fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Con
             };
         }
         KeyCode::Char('p') if state.tab == ActiveTab::Databases => state.open_provision(),
-        KeyCode::Char('e') if state.tab == ActiveTab::Databases => state.open_reset_password(),
         KeyCode::Enter if state.tab == ActiveTab::Backups => state.open_restore(),
         KeyCode::Char('r') => {
             state.reload(store, cfg)?;
@@ -824,8 +1255,8 @@ fn handle_result_key(state: &mut TuiState, code: KeyCode) {
 }
 
 fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
-    let (kind, data, first_empty) = match &state.modal {
-        Modal::Form { kind, fields, .. } => {
+    let (kind, data, payload, first_empty) = match &state.modal {
+        Modal::Form { kind, fields, payload, .. } => {
             let data: Vec<String> = fields
                 .iter()
                 .map(|f| f.input.value.trim().to_string())
@@ -835,7 +1266,7 @@ fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
                 .enumerate()
                 .find(|(i, f)| f.required && data[*i].is_empty())
                 .map(|(i, f)| (i, f.label));
-            (*kind, data, first_empty)
+            (*kind, data, payload.clone(), first_empty)
         }
         _ => return Ok(()),
     };
@@ -966,6 +1397,133 @@ fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
                 },
             }
         }
+        FormKind::EditClient => {
+            let email = if data[2].is_empty() {
+                None
+            } else {
+                Some(data[2].as_str())
+            };
+            match store.update_client(&payload, &data[0], &data[1], email) {
+                Ok(()) => {
+                    state.modal = Modal::None;
+                    state.reload(store, cfg)?;
+                    state.status = format!("✓ cliente '{}' actualizado", data[0]);
+                    state.switch_tab(ActiveTab::Clients);
+                }
+                Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+            }
+        }
+        FormKind::EditApp => {
+            match store.update_app(&payload, &data[0], &data[1], &data[2], &data[3]) {
+                Ok(()) => {
+                    state.modal = Modal::None;
+                    state.reload(store, cfg)?;
+                    state.status = format!("✓ app '{}/{}' actualizada", data[0], data[1]);
+                    state.switch_tab(ActiveTab::Apps);
+                }
+                Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+            }
+        }
+        FormKind::AddAlias => {
+            // payload = app_id
+            match store.add_domain_alias(&payload, &data[0]) {
+                Ok(alias) => {
+                    state.modal = Modal::None;
+                    state.reload(store, cfg)?;
+                    state.status = format!("✓ alias '{}' agregado", alias.domain);
+                    state.switch_tab(ActiveTab::Apps);
+                }
+                Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+            }
+        }
+        FormKind::AddSshUser => {
+            let home_dir = if data[3].is_empty() {
+                format!("/home/{}", data[1])
+            } else {
+                data[3].clone()
+            };
+            // data[4] = app slug ("(ninguna)" → None)
+            let app_slug = if data[4] == "(ninguna)" || data[4].is_empty() {
+                None
+            } else {
+                Some(data[4].as_str())
+            };
+            match ssh::create_user(&data[1], &data[2], &home_dir) {
+                Err(e) => set_modal_error(&mut state.modal, format!("useradd: {e}")),
+                Ok(()) => {
+                    match store.add_ssh_user(&data[1], &data[0], &data[2], &home_dir, app_slug) {
+                        Ok(u) => {
+                            state.modal = Modal::None;
+                            state.reload(store, cfg)?;
+                            state.status = format!("✓ usuario SSH '{}' creado", u.username);
+                            state.switch_tab(ActiveTab::Ssh);
+                        }
+                        Err(e) => {
+                            let _ = ssh::delete_user(&data[1]);
+                            set_modal_error(&mut state.modal, e.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        FormKind::AddSshKey => {
+            // payload = user_id
+            let user_info = state
+                .ssh_users
+                .iter()
+                .find(|u| u.id == payload)
+                .map(|u| (u.username.clone(), u.home_dir.clone()));
+            match store.add_ssh_key(&payload, &data[0], &data[1]) {
+                Ok(_) => {
+                    state.modal = Modal::None;
+                    state.reload(store, cfg)?;
+                    let status = if let Some((uname, home)) = user_info {
+                        let keys = store.keys_for_user(&payload).unwrap_or_default();
+                        match ssh::sync_authorized_keys(&uname, &home, &keys) {
+                            Ok(()) => format!("✓ clave '{}' agregada a '{}'", data[0], uname),
+                            Err(e) => format!("✓ clave guardada, sync falló: {e}"),
+                        }
+                    } else {
+                        format!("✓ clave '{}' agregada", data[0])
+                    };
+                    state.status = status;
+                    state.switch_tab(ActiveTab::Ssh);
+                }
+                Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+            }
+        }
+        FormKind::EditSshUser => {
+            // payload = user_id; data[0]=client, data[1]=shell, data[2]=app
+            let old_shell_and_name = state
+                .ssh_users
+                .iter()
+                .find(|u| u.id == payload)
+                .map(|u| (u.shell.clone(), u.username.clone()));
+            let app_slug = if data[2] == "(ninguna)" || data[2].is_empty() {
+                None
+            } else {
+                Some(data[2].as_str())
+            };
+            match store.update_ssh_user(&payload, &data[0], &data[1], app_slug) {
+                Ok(()) => {
+                    if let Some((old_shell, uname)) = old_shell_and_name {
+                        if old_shell != data[1] {
+                            if let Err(e) = ssh::set_shell(&uname, &data[1]) {
+                                state.modal = Modal::None;
+                                state.reload(store, cfg)?;
+                                state.status = format!("✓ DB ok, usermod falló: {e}");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    state.modal = Modal::None;
+                    state.reload(store, cfg)?;
+                    state.status = "✓ usuario SSH actualizado".to_string();
+                    state.switch_tab(ActiveTab::Ssh);
+                }
+                Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+            }
+        }
     }
     Ok(())
 }
@@ -988,14 +1546,63 @@ fn try_confirm(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> 
             state.modal = Modal::None;
             state.reload(store, cfg)?;
             state.apps_table.select(None);
+            state.aliases_table.select(None);
             state.status = "✓ app eliminada".to_string();
         }
-        ConfirmKind::CaddyApply => match caddy::apply(cfg, &state.apps, true) {
+        ConfirmKind::DeleteAlias => {
+            store.delete_domain_alias(&payload)?;
+            state.modal = Modal::None;
+            state.reload(store, cfg)?;
+            state.aliases_table.select(None);
+            state.status = "✓ alias eliminado".to_string();
+        }
+        ConfirmKind::DeleteSshUser => {
+            // Extraer info antes de borrar
+            let username = state
+                .ssh_users
+                .iter()
+                .find(|u| u.id == payload)
+                .map(|u| u.username.clone());
+            store.delete_ssh_user(&payload)?;
+            state.modal = Modal::None;
+            state.reload(store, cfg)?;
+            state.ssh_users_table.select(None);
+            state.ssh_keys_table.select(None);
+            let mut msg = "✓ usuario SSH eliminado del panel".to_string();
+            if let Some(uname) = username {
+                if let Err(e) = ssh::delete_user(&uname) {
+                    msg = format!("✓ eliminado del panel (userdel: {e})");
+                }
+            }
+            state.status = msg;
+        }
+        ConfirmKind::DeleteSshKey => {
+            // Extraer user_id y home_dir antes de borrar
+            let user_info = state
+                .ssh_keys
+                .iter()
+                .find(|k| k.id == payload)
+                .and_then(|k| state.ssh_users.iter().find(|u| u.id == k.user_id))
+                .map(|u| (u.id.clone(), u.username.clone(), u.home_dir.clone()));
+            store.delete_ssh_key(&payload)?;
+            state.modal = Modal::None;
+            state.reload(store, cfg)?;
+            state.ssh_keys_table.select(None);
+            let mut msg = "✓ clave SSH eliminada".to_string();
+            if let Some((uid, uname, home)) = user_info {
+                let remaining = store.keys_for_user(&uid).unwrap_or_default();
+                if let Err(e) = ssh::sync_authorized_keys(&uname, &home, &remaining) {
+                    msg = format!("✓ clave eliminada, sync falló: {e}");
+                }
+            }
+            state.status = msg;
+        }
+        ConfirmKind::CaddyApply => match caddy::apply(cfg, &state.apps, &state.aliases, true) {
             Ok(()) => {
                 state.modal = Modal::Result {
                     title: "✓ Caddy Aplicado".to_string(),
                     lines: vec![
-                        format!("{} apps aplicadas.", state.apps.len()),
+                        format!("{} apps ({} aliases) aplicados.", state.apps.len(), state.aliases.len()),
                         String::new(),
                         format!("Managed: {}", cfg.caddy_managed_path.display()),
                     ],
@@ -1119,6 +1726,7 @@ fn draw(frame: &mut Frame, state: &mut TuiState) {
         ActiveTab::Apps => draw_apps(frame, state, chunks[1]),
         ActiveTab::Databases => draw_databases(frame, state, chunks[1]),
         ActiveTab::Backups => draw_backups(frame, state, chunks[1]),
+        ActiveTab::Ssh => draw_ssh(frame, state, chunks[1]),
     }
     draw_statusbar(frame, state, chunks[2]);
     draw_modal(frame, &mut state.modal, area);
@@ -1140,6 +1748,7 @@ fn draw_tabs(frame: &mut Frame, state: &TuiState, area: Rect) {
         Line::from("3 Apps"),
         Line::from("4 Databases"),
         Line::from("5 Backups"),
+        Line::from(format!("6 SSH ({})", state.ssh_users.len())),
     ];
     frame.render_widget(
         Tabs::new(titles)
@@ -1164,17 +1773,23 @@ fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
         state.status.clone()
     } else {
         match state.tab {
-            ActiveTab::Clients => "  Tab/1-5: tab   ↑↓: nav   a: add   d: delete   r: refresh   q: quit".to_string(),
-            ActiveTab::Apps =>
-                "  Tab/1-5: tab   ↑↓: nav   a: add   d: delete   c: caddy apply   r: refresh   q: quit".to_string(),
+            ActiveTab::Clients => "  1-6: tab   ↑↓: nav   a: add   e: edit   d: delete   r: refresh   q: quit".to_string(),
+            ActiveTab::Apps => match state.app_focus {
+                AppFocus::Apps    => "  Tab: foco aliases   ↑↓: nav   a: add app   e: edit   d: delete   c: caddy   r: refresh   q: quit".to_string(),
+                AppFocus::Aliases => "  Tab: foco apps   ↑↓: nav   a: add alias   d: delete alias   c: caddy   r: refresh   q: quit".to_string(),
+            },
             ActiveTab::Databases => match state.db_focus {
                 DbFocus::Servers => "  Tab: foco grants   ↑↓: nav   a: add server   p: provisionar   r: refresh   q: quit".to_string(),
                 DbFocus::Grants  => "  Tab: foco servers   ↑↓: nav   e: reset password   r: refresh   q: quit".to_string(),
             },
             ActiveTab::Backups =>
-                "  Tab/1-5: tab   ↑↓: nav   a: nuevo backup   Enter: restaurar   r: refresh   q: quit".to_string(),
+                "  1-6: tab   ↑↓: nav   a: nuevo backup   Enter: restaurar   r: refresh   q: quit".to_string(),
             ActiveTab::Dashboard =>
-                "  Tab/1-5: tab   r: refresh   q: quit".to_string(),
+                "  1-6: tab   r: refresh   q: quit".to_string(),
+            ActiveTab::Ssh => match state.ssh_focus {
+                SshFocus::Users => "  Tab: foco claves   ↑↓: nav   a: add user   e: edit   d: delete   r: refresh   q: quit".to_string(),
+                SshFocus::Keys  => "  Tab: foco users   ↑↓: nav   a: add clave   d: delete clave   r: refresh   q: quit".to_string(),
+            },
         }
     };
     frame.render_widget(
@@ -1374,6 +1989,16 @@ fn draw_clients(frame: &mut Frame, state: &mut TuiState, area: Rect) {
 }
 
 fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let apps_focused = state.app_focus == AppFocus::Apps;
+    let focused_style = Style::default().fg(Color::Cyan);
+    let normal_style = Style::default().fg(Color::DarkGray);
+
+    // ── Panel apps ──────────────────────────────────────────────────
     let header = Row::new(vec!["Client", "App", "Domain", "Upstream", "Created"])
         .style(
             Style::default()
@@ -1385,15 +2010,26 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         .apps
         .iter()
         .map(|a| {
+            let alias_count = state.aliases.iter().filter(|al| al.app_id == a.id).count();
+            let domain_cell = if alias_count > 0 {
+                format!("{} +{}", a.domain, alias_count)
+            } else {
+                a.domain.clone()
+            };
             Row::new(vec![
                 Cell::from(a.client_slug.clone()),
                 Cell::from(a.slug.clone()),
-                Cell::from(a.domain.clone()),
+                Cell::from(domain_cell),
                 Cell::from(a.upstream.clone()),
                 Cell::from(a.created_at.format("%Y-%m-%d").to_string()),
             ])
         })
         .collect();
+    let apps_title = if apps_focused {
+        format!(" Apps ({}) ● — a: add  e: edit  d: delete  Tab: aliases ", state.apps.len())
+    } else {
+        format!(" Apps ({}) — Tab: focus ", state.apps.len())
+    };
     let table = Table::new(
         rows,
         [
@@ -1408,14 +2044,70 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Apps ({}) ", state.apps.len())),
+            .title(apps_title)
+            .border_style(if apps_focused { focused_style } else { normal_style }),
     )
     .row_highlight_style(
         Style::default()
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
-    frame.render_stateful_widget(table, area, &mut state.apps_table);
+    frame.render_stateful_widget(table, chunks[0], &mut state.apps_table);
+
+    // ── Panel aliases ──────────────────────────────────────────────
+    let filtered_aliases: Vec<&DomainAlias> = state.filtered_aliases();
+    let aliases_focused = state.app_focus == AppFocus::Aliases;
+    let selected_app_name = state
+        .selected_app()
+        .map(|a| format!("{}/{}", a.client_slug, a.slug));
+
+    let aliases_title = match (&selected_app_name, aliases_focused) {
+        (Some(name), true) => format!(
+            " Dominios Alias ● {} ({}) — a: add  d: delete ",
+            name,
+            filtered_aliases.len()
+        ),
+        (Some(name), false) => format!(
+            " Dominios Alias {} ({}) — Tab: focus ",
+            name,
+            filtered_aliases.len()
+        ),
+        (None, _) => " Dominios Alias — selecciona una app ↑↓ ".to_string(),
+    };
+
+    let alias_header = Row::new(vec!["Dominio Alias", "Agregado"])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
+    let alias_rows: Vec<Row> = filtered_aliases
+        .iter()
+        .map(|al| {
+            Row::new(vec![
+                Cell::from(al.domain.clone()),
+                Cell::from(al.created_at.format("%Y-%m-%d").to_string()),
+            ])
+        })
+        .collect();
+    let aliases_table = Table::new(
+        alias_rows,
+        [Constraint::Percentage(82), Constraint::Percentage(18)],
+    )
+    .header(alias_header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(aliases_title)
+            .border_style(if aliases_focused { focused_style } else { normal_style }),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(aliases_table, chunks[1], &mut state.aliases_table);
 }
 
 fn draw_databases(frame: &mut Frame, state: &mut TuiState, area: Rect) {
@@ -1588,6 +2280,134 @@ fn draw_backups(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     );
     frame.render_stateful_widget(table, area, &mut state.backups_table);
 }
+
+fn draw_ssh(frame: &mut Frame, state: &mut TuiState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    let users_focused = state.ssh_focus == SshFocus::Users;
+    let focused_style = Style::default().fg(Color::Cyan);
+    let normal_style = Style::default().fg(Color::DarkGray);
+
+    let user_header = Row::new(vec!["Cliente", "App", "Username", "Shell", "Home Dir", "Creado"])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
+    let user_rows: Vec<Row> = state
+        .ssh_users
+        .iter()
+        .map(|u| {
+            Row::new(vec![
+                Cell::from(u.client_slug.clone()),
+                Cell::from(u.app_slug.clone().unwrap_or_else(|| "—".to_string())),
+                Cell::from(u.username.clone()),
+                Cell::from(u.shell.clone()),
+                Cell::from(u.home_dir.clone()),
+                Cell::from(u.created_at.format("%Y-%m-%d").to_string()),
+            ])
+        })
+        .collect();
+    let users_title = if users_focused {
+        format!(
+            " SSH Users ● ({}) — a: add  e: edit  d: delete ",
+            state.ssh_users.len()
+        )
+    } else {
+        format!(" SSH Users ({}) — Tab: focus ", state.ssh_users.len())
+    };
+    let users_table = Table::new(
+        user_rows,
+        [
+            Constraint::Percentage(12),
+            Constraint::Percentage(12),
+            Constraint::Percentage(16),
+            Constraint::Percentage(20),
+            Constraint::Percentage(30),
+            Constraint::Percentage(10),
+        ],
+    )
+    .header(user_header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(users_title)
+            .border_style(if users_focused { focused_style } else { normal_style }),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(users_table, chunks[0], &mut state.ssh_users_table);
+
+    let filtered_keys: Vec<&SshKey> = state.filtered_ssh_keys();
+    let keys_focused = state.ssh_focus == SshFocus::Keys;
+    let selected_user_name = state.selected_ssh_user().map(|u| u.username.clone());
+
+    let keys_title = match (&selected_user_name, keys_focused) {
+        (Some(name), true) => format!(
+            " SSH Keys ● {} ({}) — a: add  d: delete ",
+            name,
+            filtered_keys.len()
+        ),
+        (Some(name), false) => format!(
+            " SSH Keys {} ({}) — Tab: focus ",
+            name,
+            filtered_keys.len()
+        ),
+        (None, _) => " SSH Keys — selecciona un usuario ↑↓ ".to_string(),
+    };
+
+    let key_header = Row::new(vec!["Etiqueta", "Tipo", "Comentario", "Creada"])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
+    let key_rows: Vec<Row> = filtered_keys
+        .iter()
+        .map(|k| {
+            let parts: Vec<&str> = k.public_key.split_whitespace().collect();
+            let key_type = parts.first().copied().unwrap_or("?");
+            let comment = parts.get(2).copied().unwrap_or("");
+            Row::new(vec![
+                Cell::from(k.label.clone()),
+                Cell::from(key_type.to_string()),
+                Cell::from(comment.to_string()),
+                Cell::from(k.created_at.format("%Y-%m-%d").to_string()),
+            ])
+        })
+        .collect();
+    let keys_table = Table::new(
+        key_rows,
+        [
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(45),
+            Constraint::Percentage(15),
+        ],
+    )
+    .header(key_header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(keys_title)
+            .border_style(if keys_focused { focused_style } else { normal_style }),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(keys_table, chunks[1], &mut state.ssh_keys_table);
+}
+
 
 // ── Modal rendering ───────────────────────────────────────────────────────────
 

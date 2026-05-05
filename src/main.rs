@@ -6,6 +6,7 @@ mod doctor;
 mod export;
 mod mssql;
 mod schedule;
+mod ssh;
 mod store;
 mod tui;
 
@@ -280,9 +281,9 @@ fn main() -> Result<()> {
                     println!("import ya existía en {}", cfg.caddyfile_path.display());
                 }
             }
-            CaddySubcommand::Render => print!("{}", caddy::render_block(&store.list_apps()?)),
+            CaddySubcommand::Render => print!("{}", caddy::render_block(&store.list_apps()?, &store.list_domain_aliases()?)),
             CaddySubcommand::Apply { reload } => {
-                caddy::apply(&cfg, &store.list_apps()?, reload)?;
+                caddy::apply(&cfg, &store.list_apps()?, &store.list_domain_aliases()?, reload)?;
                 println!(
                     "Caddy managed actualizado: {}",
                     cfg.caddy_managed_path.display()

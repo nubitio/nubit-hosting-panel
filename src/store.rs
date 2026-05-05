@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainAlias {
+    pub id: String,
+    pub app_id: String,
+    pub domain: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Client {
     pub id: String,
     pub slug: String,
@@ -30,6 +38,26 @@ pub struct DbServer {
     pub kind: String,
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshUser {
+    pub id: String,
+    pub client_slug: String,
+    pub app_slug: Option<String>,
+    pub username: String,
+    pub shell: String,
+    pub home_dir: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshKey {
+    pub id: String,
+    pub user_id: String,
+    pub label: String,
+    pub public_key: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,8 +125,37 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE(server_id, db_name, username, host)
     );
     "#,
-    // v2 — ejemplo futuro:
-    // r#"ALTER TABLE clients ADD COLUMN notes TEXT;"#,
+    // v2 — usuarios y claves SSH
+    r#"
+    CREATE TABLE IF NOT EXISTS ssh_users (
+        id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+        username TEXT NOT NULL UNIQUE,
+        shell TEXT NOT NULL DEFAULT '/bin/bash',
+        home_dir TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ssh_keys (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES ssh_users(id) ON DELETE CASCADE,
+        label TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(user_id, label)
+    );
+    "#,
+    // v3 — asociación opcional SSH user → app
+    r#"ALTER TABLE ssh_users ADD COLUMN app_id TEXT REFERENCES apps(id) ON DELETE SET NULL;"#,
+    // v4 — dominios alias por app
+    r#"
+    CREATE TABLE IF NOT EXISTS domain_aliases (
+        id TEXT PRIMARY KEY,
+        app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+        domain TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    );
+    "#,
 ];
 
 impl Store {
@@ -359,6 +416,233 @@ impl Store {
             "INSERT OR IGNORE INTO database_grants (id, server_id, client_id, app_id, env, db_name, username, host, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![Uuid::new_v4().to_string(), server_id, client_id, app_id, env, db_name, username, host, Utc::now().to_rfc3339()],
         )?;
+        Ok(())
+    }
+
+    pub fn update_client(&self, id: &str, slug: &str, name: &str, email: Option<&str>) -> Result<()> {
+        validate_slug(slug)?;
+        let changed = self.conn.execute(
+            "UPDATE clients SET slug = ?1, name = ?2, email = ?3 WHERE id = ?4",
+            params![slug, name, email, id],
+        )?;
+        if changed == 0 {
+            bail!("cliente no encontrado: {}", id);
+        }
+        Ok(())
+    }
+
+    pub fn update_app(
+        &self,
+        id: &str,
+        client_slug: &str,
+        slug: &str,
+        domain: &str,
+        upstream: &str,
+    ) -> Result<()> {
+        validate_slug(client_slug)?;
+        validate_slug(slug)?;
+        let client_id = self.client_id(client_slug)?;
+        let changed = self.conn.execute(
+            "UPDATE apps SET client_id = ?1, slug = ?2, domain = ?3, upstream = ?4 WHERE id = ?5",
+            params![client_id, slug, domain, upstream, id],
+        )?;
+        if changed == 0 {
+            bail!("app no encontrada: {}", id);
+        }
+        Ok(())
+    }
+
+    pub fn add_ssh_user(
+        &self,
+        username: &str,
+        client_slug: &str,
+        shell: &str,
+        home_dir: &str,
+        app_slug: Option<&str>,
+    ) -> Result<SshUser> {
+        validate_slug(username)?;
+        let client_id = self.client_id(client_slug)?;
+        let app_id = match app_slug {
+            Some(a) => Some(self.app_id(client_slug, a)?),
+            None => None,
+        };
+        let user = SshUser {
+            id: Uuid::new_v4().to_string(),
+            client_slug: client_slug.to_string(),
+            app_slug: app_slug.map(str::to_string),
+            username: username.to_string(),
+            shell: shell.to_string(),
+            home_dir: home_dir.to_string(),
+            created_at: Utc::now(),
+        };
+        self.conn.execute(
+            "INSERT INTO ssh_users (id, client_id, app_id, username, shell, home_dir, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![user.id, client_id, app_id, user.username, user.shell, user.home_dir, user.created_at.to_rfc3339()],
+        )?;
+        Ok(user)
+    }
+
+    pub fn list_ssh_users(&self) -> Result<Vec<SshUser>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT u.id, c.slug, a.slug, u.username, u.shell, u.home_dir, u.created_at
+             FROM ssh_users u
+             JOIN clients c ON c.id = u.client_id
+             LEFT JOIN apps a ON a.id = u.app_id
+             ORDER BY c.slug, u.username",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SshUser {
+                id: row.get(0)?,
+                client_slug: row.get(1)?,
+                app_slug: row.get(2)?,
+                username: row.get(3)?,
+                shell: row.get(4)?,
+                home_dir: row.get(5)?,
+                created_at: parse_dt(row.get::<_, String>(6)?)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn update_ssh_user(
+        &self,
+        id: &str,
+        client_slug: &str,
+        shell: &str,
+        app_slug: Option<&str>,
+    ) -> Result<()> {
+        let client_id = self.client_id(client_slug)?;
+        let app_id = match app_slug {
+            Some(a) => Some(self.app_id(client_slug, a)?),
+            None => None,
+        };
+        let changed = self.conn.execute(
+            "UPDATE ssh_users SET client_id = ?1, shell = ?2, app_id = ?3 WHERE id = ?4",
+            params![client_id, shell, app_id, id],
+        )?;
+        if changed == 0 {
+            bail!("usuario SSH no encontrado: {}", id);
+        }
+        Ok(())
+    }
+
+    pub fn delete_ssh_user(&self, id: &str) -> Result<()> {
+        let changed = self.conn.execute("DELETE FROM ssh_users WHERE id = ?1", [id])?;
+        if changed == 0 {
+            bail!("usuario SSH no encontrado: {}", id);
+        }
+        Ok(())
+    }
+
+    pub fn add_ssh_key(&self, user_id: &str, label: &str, public_key: &str) -> Result<SshKey> {
+        let key = SshKey {
+            id: Uuid::new_v4().to_string(),
+            user_id: user_id.to_string(),
+            label: label.to_string(),
+            public_key: public_key.to_string(),
+            created_at: Utc::now(),
+        };
+        self.conn.execute(
+            "INSERT INTO ssh_keys (id, user_id, label, public_key, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![key.id, key.user_id, key.label, key.public_key, key.created_at.to_rfc3339()],
+        )?;
+        Ok(key)
+    }
+
+    pub fn list_ssh_keys(&self) -> Result<Vec<SshKey>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, user_id, label, public_key, created_at FROM ssh_keys ORDER BY user_id, created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SshKey {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                label: row.get(2)?,
+                public_key: row.get(3)?,
+                created_at: parse_dt(row.get::<_, String>(4)?)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn keys_for_user(&self, user_id: &str) -> Result<Vec<SshKey>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, user_id, label, public_key, created_at FROM ssh_keys WHERE user_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([user_id], |row| {
+            Ok(SshKey {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                label: row.get(2)?,
+                public_key: row.get(3)?,
+                created_at: parse_dt(row.get::<_, String>(4)?)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn delete_ssh_key(&self, id: &str) -> Result<()> {
+        let changed = self.conn.execute("DELETE FROM ssh_keys WHERE id = ?1", [id])?;
+        if changed == 0 {
+            bail!("clave SSH no encontrada: {}", id);
+        }
+        Ok(())
+    }
+
+    pub fn add_domain_alias(&self, app_id: &str, domain: &str) -> Result<DomainAlias> {
+        if domain.trim().is_empty() {
+            bail!("el dominio no puede estar vacío");
+        }
+        let alias = DomainAlias {
+            id: Uuid::new_v4().to_string(),
+            app_id: app_id.to_string(),
+            domain: domain.trim().to_string(),
+            created_at: Utc::now(),
+        };
+        self.conn.execute(
+            "INSERT INTO domain_aliases (id, app_id, domain, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![alias.id, alias.app_id, alias.domain, alias.created_at.to_rfc3339()],
+        )?;
+        Ok(alias)
+    }
+
+    pub fn list_domain_aliases(&self) -> Result<Vec<DomainAlias>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, app_id, domain, created_at FROM domain_aliases ORDER BY app_id, domain",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DomainAlias {
+                id: row.get(0)?,
+                app_id: row.get(1)?,
+                domain: row.get(2)?,
+                created_at: parse_dt(row.get::<_, String>(3)?)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn aliases_for_app(&self, app_id: &str) -> Result<Vec<DomainAlias>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, app_id, domain, created_at FROM domain_aliases WHERE app_id = ?1 ORDER BY domain",
+        )?;
+        let rows = stmt.query_map([app_id], |row| {
+            Ok(DomainAlias {
+                id: row.get(0)?,
+                app_id: row.get(1)?,
+                domain: row.get(2)?,
+                created_at: parse_dt(row.get::<_, String>(3)?)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn delete_domain_alias(&self, id: &str) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM domain_aliases WHERE id = ?1", [id])?;
+        if changed == 0 {
+            bail!("alias no encontrado: {}", id);
+        }
         Ok(())
     }
 
