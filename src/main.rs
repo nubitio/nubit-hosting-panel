@@ -9,6 +9,7 @@ mod schedule;
 mod ssh;
 mod store;
 mod tui;
+mod update;
 
 use std::path::PathBuf;
 
@@ -47,6 +48,15 @@ enum Command {
     Export {
         #[arg(long, default_value = "hostingctl-export.json")]
         out: PathBuf,
+    },
+    /// Auto-actualizar hostingctl desde GitHub Releases
+    Update {
+        /// Solo verificar si hay actualización, sin instalar
+        #[arg(long)]
+        check: bool,
+        /// Reinstalar aunque ya sea la versión más reciente
+        #[arg(long)]
+        force: bool,
     },
     /// Importar metadata del panel desde JSON
     Import {
@@ -300,6 +310,9 @@ fn main() -> Result<()> {
                 exported.db_servers.len(),
                 exported.database_grants.len()
             );
+        }
+        Command::Update { check, force } => {
+            update::run(check, force)?;
         }
         Command::Import { path, dry_run, yes } => {
             let imported = export::read(&path)?;
