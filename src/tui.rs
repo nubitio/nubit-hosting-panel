@@ -2,11 +2,16 @@
 
 mod selection;
 
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs, io,
+    io::{BufRead, BufReader, Read, Write},
+    path::PathBuf,
+    sync::mpsc,
+};
 
 use color_eyre::eyre::Result;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -24,7 +29,7 @@ use std::collections::HashMap;
 use crate::{
     backup, caddy,
     config::Config,
-    db, doctor, ssh,
+    db, docker, doctor, ssh,
     store::{
         App as HostingApp, Client, DatabaseGrant, DbServer, DomainAlias, SshKey, SshUser, Store,
     },
@@ -315,6 +320,28 @@ enum Modal {
         title: String,
         lines: Vec<String>,
     },
+    Logs(LogsModal),
+    Shell(ShellModal),
+}
+
+struct LogsModal {
+    title: String,
+    container: String,
+    lines: Vec<String>,
+    query: String,
+    filter_active: bool,
+    follow: bool,
+    paused: bool,
+    rx: mpsc::Receiver<String>,
+    child: Option<std::process::Child>,
+}
+
+struct ShellModal {
+    title: String,
+    output: Vec<String>,
+    rx: mpsc::Receiver<String>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
 // ── Backup entry ──────────────────────────────────────────────────────────────
@@ -465,16 +492,11 @@ impl TuiState {
     fn refresh_container_status(&mut self) {
         self.container_status.clear();
         for app in &self.apps {
-            let host = app.upstream.split(':').next().unwrap_or("");
-            // Solo intentamos docker inspect si el host no es una IP ni localhost
-            let is_ip = host == "localhost"
-                || host.starts_with("127.")
-                || host.parse::<std::net::IpAddr>().is_ok();
-            if is_ip || host.is_empty() {
+            let Some(host) = docker::container_name_from_upstream(&app.upstream) else {
                 continue;
-            }
+            };
             if let Ok(out) = std::process::Command::new("docker")
-                .args(["inspect", "--format", "{{.State.Status}}", host])
+                .args(["inspect", "--format", "{{.State.Status}}", &host])
                 .output()
             {
                 if out.status.success() {
@@ -1033,6 +1055,64 @@ impl TuiState {
         }
     }
 
+    fn open_logs(&mut self) {
+        if self.tab != ActiveTab::Apps || self.app_focus != AppFocus::Apps {
+            self.status = "Selecciona una app con upstream de contenedor".to_string();
+            return;
+        }
+        let Some(app) = self.selected_app() else {
+            self.status = "Selecciona una app primero (↑↓)".to_string();
+            return;
+        };
+        match spawn_logs_modal(app) {
+            Ok(modal) => self.modal = Modal::Logs(modal),
+            Err(e) => self.status = format!("logs: {e}"),
+        }
+    }
+
+    fn open_shell(&mut self, area: Rect) {
+        if self.tab != ActiveTab::Apps || self.app_focus != AppFocus::Apps {
+            self.status = "Selecciona una app con upstream de contenedor".to_string();
+            return;
+        }
+        let Some(app) = self.selected_app() else {
+            self.status = "Selecciona una app primero (↑↓)".to_string();
+            return;
+        };
+        match spawn_shell_modal(app, area) {
+            Ok(modal) => self.modal = Modal::Shell(modal),
+            Err(e) => self.status = format!("shell: {e}"),
+        }
+    }
+
+    fn poll_modal_streams(&mut self) {
+        match &mut self.modal {
+            Modal::Logs(logs) => {
+                if !logs.paused {
+                    while let Ok(line) = logs.rx.try_recv() {
+                        logs.lines.push(line);
+                        if logs.lines.len() > 5_000 {
+                            logs.lines.drain(0..1_000);
+                        }
+                    }
+                }
+            }
+            Modal::Shell(shell) => {
+                while let Ok(chunk) = shell.rx.try_recv() {
+                    for line in chunk.replace('\r', "").split('\n') {
+                        if !line.is_empty() {
+                            shell.output.push(line.to_string());
+                        }
+                    }
+                    if shell.output.len() > 5_000 {
+                        shell.output.drain(0..1_000);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn open_restore(&mut self) {
         if let Some(backup) = self
             .backups_table
@@ -1304,7 +1384,13 @@ fn handle_filter_key(state: &mut TuiState, code: KeyCode) {
     }
 }
 
-fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Config) -> Result<()> {
+fn handle_main_key(
+    state: &mut TuiState,
+    code: KeyCode,
+    store: &Store,
+    cfg: &Config,
+    area: Rect,
+) -> Result<()> {
     match code {
         KeyCode::Tab => {
             if state.tab == ActiveTab::Databases {
@@ -1352,6 +1438,8 @@ fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Con
                 payload: String::new(),
             };
         }
+        KeyCode::Char('l') if state.tab == ActiveTab::Apps => state.open_logs(),
+        KeyCode::Char('s') if state.tab == ActiveTab::Apps => state.open_shell(area),
         KeyCode::Char('p') if state.tab == ActiveTab::Databases => state.open_provision(),
         KeyCode::Enter if state.tab == ActiveTab::Backups => state.open_restore(),
         KeyCode::Char('r') => {
@@ -1493,6 +1581,74 @@ fn handle_result_key(state: &mut TuiState, code: KeyCode) {
     if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
         state.modal = Modal::None;
     }
+}
+
+fn handle_logs_key(state: &mut TuiState, code: KeyCode) {
+    if let Modal::Logs(logs) = &mut state.modal {
+        if logs.filter_active {
+            match code {
+                KeyCode::Esc => {
+                    logs.query.clear();
+                    logs.filter_active = false;
+                }
+                KeyCode::Enter => logs.filter_active = false,
+                KeyCode::Backspace => {
+                    logs.query.pop();
+                }
+                KeyCode::Char(c) => logs.query.push(c),
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if let Some(mut child) = logs.child.take() {
+                    let _ = child.kill();
+                }
+                state.modal = Modal::None;
+            }
+            KeyCode::Char('/') => logs.filter_active = true,
+            KeyCode::Char('p') => logs.paused = !logs.paused,
+            KeyCode::Char('f') => logs.follow = !logs.follow,
+            KeyCode::Char('c') => logs.lines.clear(),
+            _ => {}
+        }
+    }
+}
+
+fn handle_shell_key(state: &mut TuiState, key: KeyEvent) -> Result<()> {
+    if let Modal::Shell(shell) = &mut state.modal {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+            let _ = shell.child.kill();
+            state.modal = Modal::None;
+            return Ok(());
+        }
+        let bytes: Vec<u8> = match key.code {
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match c.to_ascii_lowercase() {
+                    'c' => vec![0x03],
+                    'd' => vec![0x04],
+                    'l' => vec![0x0c],
+                    _ => return Ok(()),
+                }
+            }
+            KeyCode::Char(c) => c.to_string().into_bytes(),
+            KeyCode::Enter => b"\r".to_vec(),
+            KeyCode::Backspace => vec![0x7f],
+            KeyCode::Tab => b"\t".to_vec(),
+            KeyCode::Left => b"\x1b[D".to_vec(),
+            KeyCode::Right => b"\x1b[C".to_vec(),
+            KeyCode::Up => b"\x1b[A".to_vec(),
+            KeyCode::Down => b"\x1b[B".to_vec(),
+            KeyCode::Esc => b"\x1b".to_vec(),
+            _ => Vec::new(),
+        };
+        if !bytes.is_empty() {
+            shell.writer.write_all(&bytes)?;
+            shell.writer.flush()?;
+        }
+    }
+    Ok(())
 }
 
 fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
@@ -1935,6 +2091,94 @@ fn rand_password() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 32)
 }
 
+fn spawn_logs_modal(app: &HostingApp) -> Result<LogsModal> {
+    let container = docker::container_name_from_upstream(&app.upstream)
+        .ok_or_else(|| color_eyre::eyre::eyre!("app no apunta a contenedor local"))?;
+    let mut child = docker::spawn_logs(&container, 300, true)?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = mpsc::channel();
+    if let Some(out) = stdout {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+    if let Some(err) = stderr {
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+    Ok(LogsModal {
+        title: format!(" Logs {}/{} — {} ", app.client_slug, app.slug, container),
+        container,
+        lines: Vec::new(),
+        query: String::new(),
+        filter_active: false,
+        follow: true,
+        paused: false,
+        rx,
+        child: Some(child),
+    })
+}
+
+fn spawn_shell_modal(app: &HostingApp, area: Rect) -> Result<ShellModal> {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let container = docker::container_name_from_upstream(&app.upstream)
+        .ok_or_else(|| color_eyre::eyre::eyre!("app no apunta a contenedor local"))?;
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: area.height.saturating_sub(4).max(5),
+            cols: area.width.saturating_sub(4).max(20),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    let mut cmd = CommandBuilder::new("docker");
+    cmd.args(["exec", "-it", &container, "/bin/sh"]);
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = tx.send(chunk);
+                }
+            }
+        }
+    });
+    Ok(ShellModal {
+        title: format!(
+            " Shell {}/{} — {}  Ctrl+Q: salir ",
+            app.client_slug, app.slug, container
+        ),
+        output: Vec::new(),
+        rx,
+        writer,
+        child,
+    })
+}
+
 struct TerminalRestoreGuard {
     active: bool,
 }
@@ -1975,6 +2219,7 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
             state.sys_info = load_sys_info();
             state.last_sys_refresh = now;
         }
+        state.poll_modal_streams();
 
         terminal.draw(|frame| draw(frame, &mut state))?;
 
@@ -1992,7 +2237,10 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
                     Ok(())
                 } else {
                     match &state.modal {
-                        Modal::None => handle_main_key(&mut state, key.code, store, cfg),
+                        Modal::None => {
+                            let (w, h) = crossterm::terminal::size()?;
+                            handle_main_key(&mut state, key.code, store, cfg, Rect::new(0, 0, w, h))
+                        }
                         Modal::Form { .. } => handle_form_key(&mut state, key.code, store, cfg),
                         Modal::Confirm { .. } => {
                             handle_confirm_key(&mut state, key.code, store, cfg)
@@ -2001,6 +2249,11 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
                             handle_result_key(&mut state, key.code);
                             Ok(())
                         }
+                        Modal::Logs(_) => {
+                            handle_logs_key(&mut state, key.code);
+                            Ok(())
+                        }
+                        Modal::Shell(_) => handle_shell_key(&mut state, key),
                     }
                 };
                 if let Err(e) = result {
@@ -2109,7 +2362,7 @@ fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
             }
             ActiveTab::Apps => match state.app_focus {
                 AppFocus::Apps => {
-                    "  Tab: aliases   ↑↓: nav   a: add   e: edit   d: delete   /: filtrar   c: caddy   r: refresh   q: quit"
+                    "  Tab: aliases   ↑↓: nav   a/e/d   l: logs   s: shell   /: filtrar   c: caddy   r: refresh   q: quit"
                 }
                 AppFocus::Aliases => {
                     "  Tab: apps   ↑↓: nav   a: add alias   d: delete alias   c: caddy   r: refresh   q: quit"
@@ -2251,6 +2504,100 @@ fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
         chunks[0],
     );
 
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(10), Constraint::Min(0)])
+        .split(chunks[1]);
+
+    let container_apps: Vec<(&HostingApp, String)> = state
+        .apps
+        .iter()
+        .filter_map(|app| {
+            docker::container_name_from_upstream(&app.upstream).map(|name| (app, name))
+        })
+        .collect();
+    let running = container_apps
+        .iter()
+        .filter(|(app, _)| {
+            state
+                .container_status
+                .get(&app.id)
+                .is_some_and(|status| status == "running")
+        })
+        .count();
+    let known_down = container_apps
+        .iter()
+        .filter(|(app, _)| {
+            state
+                .container_status
+                .get(&app.id)
+                .is_some_and(|status| status != "running")
+        })
+        .count();
+    let unknown = container_apps.len().saturating_sub(running + known_down);
+    let mut container_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Running: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                running.to_string(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Down: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                known_down.to_string(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Unknown: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                unknown.to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    for (app, container) in container_apps.iter().take(5) {
+        let status = state
+            .container_status
+            .get(&app.id)
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        let (marker, color) = match status {
+            "running" => ("●", Color::Green),
+            "unknown" => ("?", Color::Yellow),
+            _ => ("●", Color::Red),
+        };
+        container_lines.push(Line::from(vec![
+            Span::styled(format!("  {marker} "), Style::default().fg(color)),
+            Span::styled(
+                format!("{}/{}", app.client_slug, app.slug),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!(" — {container} ({status})"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    if container_apps.len() > 5 {
+        container_lines.push(Line::from(format!("  … {} más", container_apps.len() - 5)));
+    }
+    if container_apps.is_empty() {
+        container_lines.push(Line::from("  Sin apps con upstream de contenedor local"));
+    }
+    frame.render_widget(
+        Paragraph::new(container_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Contenedores "),
+        ),
+        right_chunks[0],
+    );
+
     let doctor_lines: Vec<Line> = if !state.doctor_loaded {
         vec![Line::from("  Ejecutando checks...")]
     } else {
@@ -2284,7 +2631,7 @@ fn draw_dashboard(frame: &mut Frame, state: &TuiState, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(doctor_lines).block(Block::default().borders(Borders::ALL).title(dtitle)),
-        chunks[1],
+        right_chunks[1],
     );
 }
 
@@ -2831,7 +3178,95 @@ fn draw_modal(frame: &mut Frame, modal: &mut Modal, area: Rect) {
             frame.render_widget(Clear, popup);
             draw_result(frame, title, lines, popup);
         }
+        Modal::Logs(logs) => draw_logs_modal(frame, logs, area),
+        Modal::Shell(shell) => draw_shell_modal(frame, shell, area),
     }
+}
+
+fn draw_logs_modal(frame: &mut Frame, logs: &LogsModal, area: Rect) {
+    let popup = centered_rect(92, area.height.saturating_sub(4).max(10), area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(logs.title.clone())
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let query = logs.query.to_lowercase();
+    let visible: Vec<Line> = logs
+        .lines
+        .iter()
+        .filter(|line| query.is_empty() || line.to_lowercase().contains(&query))
+        .rev()
+        .take(chunks[0].height as usize)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| styled_log_line(line, &query))
+        .collect();
+    frame.render_widget(Paragraph::new(visible), chunks[0]);
+    let hint = if logs.filter_active {
+        format!(" /{}▌  Enter: aplicar  Esc: limpiar", logs.query)
+    } else {
+        format!(
+            " /: buscar  p: pause={}  f: follow={}  c: clear  q/Esc: volver  container={}",
+            logs.paused, logs.follow, logs.container
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn styled_log_line(line: &str, query: &str) -> Line<'static> {
+    let lower = line.to_lowercase();
+    let color = if lower.contains("error") || lower.contains("fatal") || lower.contains("panic") {
+        Color::Red
+    } else if lower.contains("warn") {
+        Color::Yellow
+    } else if lower.contains("info") {
+        Color::Green
+    } else {
+        Color::White
+    };
+    let style = if !query.is_empty() && lower.contains(query) {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color)
+    };
+    Line::from(Span::styled(line.to_string(), style))
+}
+
+fn draw_shell_modal(frame: &mut Frame, shell: &ShellModal, area: Rect) {
+    let popup = centered_rect(96, area.height.saturating_sub(2).max(10), area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(shell.title.clone())
+        .border_style(Style::default().fg(Color::Green));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines: Vec<Line> = shell
+        .output
+        .iter()
+        .rev()
+        .take(inner.height as usize)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| {
+            Line::from(Span::styled(
+                line.clone(),
+                Style::default().fg(Color::White),
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_form(

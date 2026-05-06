@@ -72,15 +72,19 @@ curl_auth -fsSL "${URL}.sha256" -o "${TMPDIR}/${ARCHIVE}.sha256"
 
 echo "Installing to ${BIN_DIR}…"
 tar -xzf "${TMPDIR}/${ARCHIVE}" -C "${TMPDIR}"
+SRC_BIN="${TMPDIR}/hostingctl-${VERSION}-${TARGET}/${BINARY}"
+INSTALL_TMP="${BIN_DIR}/.${BINARY}.tmp.$$"
 
 if [ -w "${BIN_DIR}" ] || { [ ! -e "${BIN_DIR}" ] && [ -w "$(dirname "${BIN_DIR}")" ]; }; then
   mkdir -p "${BIN_DIR}"
-  cp "${TMPDIR}/hostingctl-${VERSION}-${TARGET}/${BINARY}" "${BIN_DIR}/${BINARY}"
-  chmod +x "${BIN_DIR}/${BINARY}"
+  cp "${SRC_BIN}" "${INSTALL_TMP}"
+  chmod +x "${INSTALL_TMP}"
+  mv -f "${INSTALL_TMP}" "${BIN_DIR}/${BINARY}"
 elif command -v sudo >/dev/null 2>&1; then
   sudo mkdir -p "${BIN_DIR}"
-  sudo cp "${TMPDIR}/hostingctl-${VERSION}-${TARGET}/${BINARY}" "${BIN_DIR}/${BINARY}"
-  sudo chmod +x "${BIN_DIR}/${BINARY}"
+  sudo cp "${SRC_BIN}" "${INSTALL_TMP}"
+  sudo chmod +x "${INSTALL_TMP}"
+  sudo mv -f "${INSTALL_TMP}" "${BIN_DIR}/${BINARY}"
 else
   echo "error: ${BIN_DIR} is not writable and sudo is unavailable" >&2
   echo "       retry with --prefix ~/.local or run as root" >&2

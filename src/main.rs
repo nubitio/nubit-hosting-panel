@@ -2,6 +2,7 @@ mod backup;
 mod caddy;
 mod config;
 mod db;
+mod docker;
 mod doctor;
 mod export;
 mod mssql;
@@ -156,6 +157,28 @@ enum AppSubcommand {
         domain: String,
         #[arg(long)]
         yes: bool,
+    },
+    Logs {
+        client: String,
+        slug: String,
+        #[arg(long, default_value_t = 200)]
+        tail: usize,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long)]
+        since: Option<String>,
+    },
+    Exec {
+        client: String,
+        slug: String,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    Shell {
+        client: String,
+        slug: String,
+        #[arg(long, default_value = "/bin/sh")]
+        shell: String,
     },
     List,
 }
@@ -486,6 +509,35 @@ fn main() -> Result<()> {
                 let alias = find_alias_by_domain(&store, &domain)?;
                 store.delete_domain_alias(&alias.id)?;
                 println!("alias eliminado: {}", domain);
+            }
+            AppSubcommand::Logs {
+                client,
+                slug,
+                tail,
+                follow,
+                since,
+            } => {
+                let app = find_app(&store, &client, &slug)?;
+                let container = container_for_app(&app)?;
+                docker::logs(&container, tail, follow, since.as_deref())?;
+            }
+            AppSubcommand::Exec {
+                client,
+                slug,
+                command,
+            } => {
+                let app = find_app(&store, &client, &slug)?;
+                let container = container_for_app(&app)?;
+                docker::exec(&container, &command)?;
+            }
+            AppSubcommand::Shell {
+                client,
+                slug,
+                shell,
+            } => {
+                let app = find_app(&store, &client, &slug)?;
+                let container = container_for_app(&app)?;
+                docker::shell(&container, &shell)?;
             }
         },
         Command::Ssh(cmd) => match cmd.command {
@@ -951,6 +1003,17 @@ fn find_app(store: &Store, client: &str, slug: &str) -> Result<HostingApp> {
         .into_iter()
         .find(|app| app.client_slug == client && app.slug == slug)
         .ok_or_else(|| color_eyre::eyre::eyre!("app no encontrada: {}/{}", client, slug))
+}
+
+fn container_for_app(app: &HostingApp) -> Result<String> {
+    docker::container_name_from_upstream(&app.upstream).ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "app {}/{} no apunta a contenedor local: {}",
+            app.client_slug,
+            app.slug,
+            app.upstream
+        )
+    })
 }
 
 fn find_alias_by_domain(store: &Store, domain: &str) -> Result<DomainAlias> {
