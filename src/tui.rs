@@ -321,7 +321,7 @@ enum Modal {
         lines: Vec<String>,
     },
     Logs(LogsModal),
-    Shell(ShellModal),
+    Shell(Box<ShellModal>),
 }
 
 struct LogsModal {
@@ -338,10 +338,13 @@ struct LogsModal {
 
 struct ShellModal {
     title: String,
-    output: Vec<String>,
-    rx: mpsc::Receiver<String>,
+    parser: vt100::Parser,
+    rx: mpsc::Receiver<Vec<u8>>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    rows: u16,
+    cols: u16,
 }
 
 // ── Backup entry ──────────────────────────────────────────────────────────────
@@ -1080,7 +1083,7 @@ impl TuiState {
             return;
         };
         match spawn_shell_modal(app, area) {
-            Ok(modal) => self.modal = Modal::Shell(modal),
+            Ok(modal) => self.modal = Modal::Shell(Box::new(modal)),
             Err(e) => self.status = format!("shell: {e}"),
         }
     }
@@ -1099,14 +1102,7 @@ impl TuiState {
             }
             Modal::Shell(shell) => {
                 while let Ok(chunk) = shell.rx.try_recv() {
-                    for line in chunk.replace('\r', "").split('\n') {
-                        if !line.is_empty() {
-                            shell.output.push(line.to_string());
-                        }
-                    }
-                    if shell.output.len() > 5_000 {
-                        shell.output.drain(0..1_000);
-                    }
+                    shell.parser.process(&chunk);
                 }
             }
             _ => {}
@@ -1610,7 +1606,7 @@ fn handle_logs_key(state: &mut TuiState, code: KeyCode) {
             KeyCode::Char('/') => logs.filter_active = true,
             KeyCode::Char('p') => logs.paused = !logs.paused,
             KeyCode::Char('f') => logs.follow = !logs.follow,
-            KeyCode::Char('c') => logs.lines.clear(),
+            KeyCode::Char('c') => clear_logs_modal(logs),
             _ => {}
         }
     }
@@ -2094,7 +2090,25 @@ fn rand_password() -> String {
 fn spawn_logs_modal(app: &HostingApp) -> Result<LogsModal> {
     let container = docker::container_name_from_upstream(&app.upstream)
         .ok_or_else(|| color_eyre::eyre::eyre!("app no apunta a contenedor local"))?;
-    let mut child = docker::spawn_logs(&container, 300, true)?;
+    let (child, rx) = spawn_log_stream(&container, 300)?;
+    Ok(LogsModal {
+        title: format!(" Logs {}/{} — {} ", app.client_slug, app.slug, container),
+        container,
+        lines: Vec::new(),
+        query: String::new(),
+        filter_active: false,
+        follow: true,
+        paused: false,
+        rx,
+        child: Some(child),
+    })
+}
+
+fn spawn_log_stream(
+    container: &str,
+    tail: usize,
+) -> Result<(std::process::Child, mpsc::Receiver<String>)> {
+    let mut child = docker::spawn_logs(container, tail, true)?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (tx, rx) = mpsc::channel();
@@ -2113,17 +2127,23 @@ fn spawn_logs_modal(app: &HostingApp) -> Result<LogsModal> {
             }
         });
     }
-    Ok(LogsModal {
-        title: format!(" Logs {}/{} — {} ", app.client_slug, app.slug, container),
-        container,
-        lines: Vec::new(),
-        query: String::new(),
-        filter_active: false,
-        follow: true,
-        paused: false,
-        rx,
-        child: Some(child),
-    })
+    Ok((child, rx))
+}
+
+fn clear_logs_modal(logs: &mut LogsModal) {
+    logs.lines.clear();
+    while logs.rx.try_recv().is_ok() {}
+    if let Some(mut child) = logs.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    match spawn_log_stream(&logs.container, 0) {
+        Ok((child, rx)) => {
+            logs.child = Some(child);
+            logs.rx = rx;
+        }
+        Err(e) => logs.lines.push(format!("error reiniciando logs: {e}")),
+    }
 }
 
 fn spawn_shell_modal(app: &HostingApp, area: Rect) -> Result<ShellModal> {
@@ -2131,11 +2151,13 @@ fn spawn_shell_modal(app: &HostingApp, area: Rect) -> Result<ShellModal> {
 
     let container = docker::container_name_from_upstream(&app.upstream)
         .ok_or_else(|| color_eyre::eyre::eyre!("app no apunta a contenedor local"))?;
+    let rows = area.height.saturating_sub(4).max(5);
+    let cols = area.width.saturating_sub(4).max(20);
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: area.height.saturating_sub(4).max(5),
-            cols: area.width.saturating_sub(4).max(20),
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -2161,8 +2183,7 @@ fn spawn_shell_modal(app: &HostingApp, area: Rect) -> Result<ShellModal> {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = tx.send(chunk);
+                    let _ = tx.send(buf[..n].to_vec());
                 }
             }
         }
@@ -2172,10 +2193,13 @@ fn spawn_shell_modal(app: &HostingApp, area: Rect) -> Result<ShellModal> {
             " Shell {}/{} — {}  Ctrl+Q: salir ",
             app.client_slug, app.slug, container
         ),
-        output: Vec::new(),
+        parser: vt100::Parser::new(rows, cols, 2_000),
         rx,
+        master: pair.master,
         writer,
         child,
+        rows,
+        cols,
     })
 }
 
@@ -3208,6 +3232,7 @@ fn draw_logs_modal(frame: &mut Frame, logs: &LogsModal, area: Rect) {
         .rev()
         .map(|line| styled_log_line(line, &query))
         .collect();
+    frame.render_widget(Clear, chunks[0]);
     frame.render_widget(Paragraph::new(visible), chunks[0]);
     let hint = if logs.filter_active {
         format!(" /{}▌  Enter: aplicar  Esc: limpiar", logs.query)
@@ -3242,7 +3267,9 @@ fn styled_log_line(line: &str, query: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), style))
 }
 
-fn draw_shell_modal(frame: &mut Frame, shell: &ShellModal, area: Rect) {
+fn draw_shell_modal(frame: &mut Frame, shell: &mut ShellModal, area: Rect) {
+    use portable_pty::PtySize;
+
     let popup = centered_rect(96, area.height.saturating_sub(2).max(10), area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
@@ -3251,21 +3278,30 @@ fn draw_shell_modal(frame: &mut Frame, shell: &ShellModal, area: Rect) {
         .border_style(Style::default().fg(Color::Green));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let lines: Vec<Line> = shell
-        .output
-        .iter()
-        .rev()
-        .take(inner.height as usize)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+    if shell.rows != inner.height || shell.cols != inner.width {
+        shell.rows = inner.height;
+        shell.cols = inner.width;
+        let _ = shell.master.resize(PtySize {
+            rows: shell.rows,
+            cols: shell.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        shell.parser.set_size(shell.rows, shell.cols);
+    }
+    let contents = shell.parser.screen().contents();
+    let mut lines: Vec<Line> = contents
+        .lines()
         .map(|line| {
             Line::from(Span::styled(
-                line.clone(),
+                line.to_string(),
                 Style::default().fg(Color::White),
             ))
         })
         .collect();
+    if lines.len() < inner.height as usize {
+        lines.resize(inner.height as usize, Line::from(""));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
