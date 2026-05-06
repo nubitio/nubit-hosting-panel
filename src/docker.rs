@@ -51,8 +51,26 @@ pub fn exec(container: &str, args: &[String]) -> Result<()> {
 }
 
 pub fn shell(container: &str, shell: &str) -> Result<()> {
-    let status = Command::new("docker")
-        .args(["exec", "-it", container, shell])
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "exec",
+        "-it",
+        "-e",
+        "TERM=xterm-256color",
+        "-e",
+        "COLORTERM=truecolor",
+        container,
+    ]);
+    if shell == "auto" {
+        cmd.args([
+            "sh",
+            "-lc",
+            "if command -v bash >/dev/null 2>&1; then exec bash -il; else exec sh -i; fi",
+        ]);
+    } else {
+        cmd.arg(shell);
+    }
+    let status = cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

@@ -2163,7 +2163,18 @@ fn spawn_shell_modal(app: &HostingApp, area: Rect) -> Result<ShellModal> {
         })
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
     let mut cmd = CommandBuilder::new("docker");
-    cmd.args(["exec", "-it", &container, "/bin/sh"]);
+    cmd.args([
+        "exec",
+        "-it",
+        "-e",
+        "TERM=xterm-256color",
+        "-e",
+        "COLORTERM=truecolor",
+        &container,
+        "sh",
+        "-lc",
+        "if command -v bash >/dev/null 2>&1; then exec bash -il; else exec sh -i; fi",
+    ]);
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -3289,20 +3300,88 @@ fn draw_shell_modal(frame: &mut Frame, shell: &mut ShellModal, area: Rect) {
         });
         shell.parser.set_size(shell.rows, shell.cols);
     }
-    let contents = shell.parser.screen().contents();
-    let mut lines: Vec<Line> = contents
-        .lines()
-        .map(|line| {
-            Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::White),
-            ))
+    let screen = shell.parser.screen();
+    let (rows, cols) = screen.size();
+    let mut lines: Vec<Line> = (0..rows)
+        .map(|row| {
+            let spans: Vec<Span> = (0..cols)
+                .filter_map(|col| {
+                    let cell = screen.cell(row, col)?;
+                    if cell.is_wide_continuation() {
+                        return None;
+                    }
+                    let text = if cell.has_contents() {
+                        cell.contents()
+                    } else {
+                        " ".to_string()
+                    };
+                    Some(Span::styled(text, vt_cell_style(cell)))
+                })
+                .collect();
+            Line::from(spans)
         })
         .collect();
     if lines.len() < inner.height as usize {
         lines.resize(inner.height as usize, Line::from(""));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn vt_cell_style(cell: &vt100::Cell) -> Style {
+    let mut style = Style::default();
+    let fg = vt_color(cell.fgcolor());
+    let bg = vt_color(cell.bgcolor());
+    if cell.inverse() {
+        if let Some(fg) = bg {
+            style = style.fg(fg);
+        }
+        if let Some(bg) = fg {
+            style = style.bg(bg);
+        }
+    } else {
+        if let Some(fg) = fg {
+            style = style.fg(fg);
+        }
+        if let Some(bg) = bg {
+            style = style.bg(bg);
+        }
+    }
+    if cell.bold() {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.italic() {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
+
+fn vt_color(color: vt100::Color) -> Option<Color> {
+    match color {
+        vt100::Color::Default => None,
+        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+        vt100::Color::Idx(idx) => Some(match idx {
+            0 => Color::Black,
+            1 => Color::Red,
+            2 => Color::Green,
+            3 => Color::Yellow,
+            4 => Color::Blue,
+            5 => Color::Magenta,
+            6 => Color::Cyan,
+            7 => Color::Gray,
+            8 => Color::DarkGray,
+            9 => Color::LightRed,
+            10 => Color::LightGreen,
+            11 => Color::LightYellow,
+            12 => Color::LightBlue,
+            13 => Color::LightMagenta,
+            14 => Color::LightCyan,
+            15 => Color::White,
+            other => Color::Indexed(other),
+        }),
+    }
 }
 
 fn draw_form(

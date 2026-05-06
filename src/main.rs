@@ -177,7 +177,7 @@ enum AppSubcommand {
     Shell {
         client: String,
         slug: String,
-        #[arg(long, default_value = "/bin/sh")]
+        #[arg(long, default_value = "auto")]
         shell: String,
     },
     List,
