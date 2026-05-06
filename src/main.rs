@@ -17,7 +17,10 @@ use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre::{Result, bail};
 use rand::distr::{Alphanumeric, SampleString};
 
-use crate::{config::Config, store::Store};
+use crate::{
+    config::Config,
+    store::{App as HostingApp, Client, DatabaseGrant, DomainAlias, SshUser, Store},
+};
 
 #[derive(Parser)]
 #[command(name = "hostingctl", version, about = "Nubit Hosting Panel CLI/TUI")]
@@ -40,6 +43,8 @@ enum Command {
     Client(ClientCommand),
     /// Gestionar sitios/apps
     App(AppCommand),
+    /// Gestionar usuarios y claves SSH
+    Ssh(SshCommand),
     /// Gestionar Caddyfile
     Caddy(CaddyCommand),
     /// Gestionar servidores DB, bases, usuarios y grants
@@ -83,6 +88,22 @@ enum ClientSubcommand {
         #[arg(long)]
         email: Option<String>,
     },
+    Edit {
+        slug: String,
+        #[arg(long)]
+        new_slug: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    Delete {
+        slug: String,
+        #[arg(long)]
+        yes: bool,
+    },
     List,
 }
 
@@ -102,7 +123,90 @@ enum AppSubcommand {
         #[arg(long)]
         upstream: String,
     },
+    Edit {
+        client: String,
+        slug: String,
+        #[arg(long)]
+        new_client: Option<String>,
+        #[arg(long)]
+        new_slug: Option<String>,
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        upstream: String,
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    Delete {
+        client: String,
+        slug: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    AliasAdd {
+        client: String,
+        app: String,
+        domain: String,
+    },
+    AliasList {
+        client: Option<String>,
+        app: Option<String>,
+    },
+    AliasDelete {
+        domain: String,
+        #[arg(long)]
+        yes: bool,
+    },
     List,
+}
+
+#[derive(Args)]
+struct SshCommand {
+    #[command(subcommand)]
+    command: SshSubcommand,
+}
+
+#[derive(Subcommand)]
+enum SshSubcommand {
+    UserAdd {
+        client: String,
+        username: String,
+        #[arg(long, default_value = "/bin/bash")]
+        shell: String,
+        #[arg(long)]
+        home_dir: Option<PathBuf>,
+        #[arg(long)]
+        app: Option<String>,
+    },
+    UserList,
+    UserEdit {
+        username: String,
+        #[arg(long)]
+        client: String,
+        #[arg(long, default_value = "/bin/bash")]
+        shell: String,
+        #[arg(long)]
+        app: Option<String>,
+    },
+    UserDelete {
+        username: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    KeyAdd {
+        username: String,
+        label: String,
+        public_key: String,
+    },
+    KeyList {
+        username: Option<String>,
+    },
+    KeyDelete {
+        username: String,
+        label: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Args)]
@@ -161,6 +265,19 @@ enum DbSubcommand {
         username: String,
         #[arg(long, default_value = "%")]
         host: String,
+    },
+    GrantReassign {
+        server: String,
+        database: String,
+        username: String,
+        #[arg(long, default_value = "%")]
+        host: String,
+        #[arg(long)]
+        client: String,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        env: Option<String>,
     },
     Provision {
         server: String,
@@ -257,6 +374,30 @@ fn main() -> Result<()> {
                 let client = store.add_client(&slug, &name, email.as_deref())?;
                 println!("cliente creado: {} ({})", client.slug, client.id);
             }
+            ClientSubcommand::Edit {
+                slug,
+                new_slug,
+                name,
+                email,
+                notes,
+            } => {
+                let client = find_client(&store, &slug)?;
+                let next_slug = new_slug.as_deref().unwrap_or(&slug);
+                store.update_client(
+                    &client.id,
+                    next_slug,
+                    &name,
+                    email.as_deref(),
+                    notes.as_deref(),
+                )?;
+                println!("cliente actualizado: {}", next_slug);
+            }
+            ClientSubcommand::Delete { slug, yes } => {
+                require_yes(yes, "delete client")?;
+                let client = find_client(&store, &slug)?;
+                store.delete_client(&client.id)?;
+                println!("cliente eliminado: {}", slug);
+            }
             ClientSubcommand::List => {
                 for c in store.list_clients()? {
                     println!("{}\t{}\t{}", c.slug, c.name, c.email.unwrap_or_default());
@@ -281,6 +422,169 @@ fn main() -> Result<()> {
                     println!("{}/{}\t{}\t{}", a.client_slug, a.slug, a.domain, a.upstream);
                 }
             }
+            AppSubcommand::Edit {
+                client,
+                slug,
+                new_client,
+                new_slug,
+                domain,
+                upstream,
+                notes,
+            } => {
+                let app = find_app(&store, &client, &slug)?;
+                let next_client = new_client.as_deref().unwrap_or(&client);
+                let next_slug = new_slug.as_deref().unwrap_or(&slug);
+                store.update_app(
+                    &app.id,
+                    next_client,
+                    next_slug,
+                    &domain,
+                    &upstream,
+                    notes.as_deref(),
+                )?;
+                println!("app actualizada: {}/{}", next_client, next_slug);
+            }
+            AppSubcommand::Delete { client, slug, yes } => {
+                require_yes(yes, "delete app")?;
+                let app = find_app(&store, &client, &slug)?;
+                store.delete_app(&app.id)?;
+                println!("app eliminada: {}/{}", client, slug);
+            }
+            AppSubcommand::AliasAdd {
+                client,
+                app,
+                domain,
+            } => {
+                let app = find_app(&store, &client, &app)?;
+                let alias = store.add_domain_alias(&app.id, &domain)?;
+                println!(
+                    "alias creado: {} -> {}/{}",
+                    alias.domain, app.client_slug, app.slug
+                );
+            }
+            AppSubcommand::AliasList { client, app } => {
+                let aliases = store.list_domain_aliases()?;
+                for alias in aliases {
+                    let Some(parent) = store
+                        .list_apps()?
+                        .into_iter()
+                        .find(|a| a.id == alias.app_id)
+                    else {
+                        continue;
+                    };
+                    if client.as_deref().is_some_and(|c| c != parent.client_slug) {
+                        continue;
+                    }
+                    if app.as_deref().is_some_and(|s| s != parent.slug) {
+                        continue;
+                    }
+                    println!("{}\t{}/{}", alias.domain, parent.client_slug, parent.slug);
+                }
+            }
+            AppSubcommand::AliasDelete { domain, yes } => {
+                require_yes(yes, "delete alias")?;
+                let alias = find_alias_by_domain(&store, &domain)?;
+                store.delete_domain_alias(&alias.id)?;
+                println!("alias eliminado: {}", domain);
+            }
+        },
+        Command::Ssh(cmd) => match cmd.command {
+            SshSubcommand::UserAdd {
+                client,
+                username,
+                shell,
+                home_dir,
+                app,
+            } => {
+                let home_dir = home_dir
+                    .unwrap_or_else(|| PathBuf::from(format!("/home/{username}")))
+                    .to_string_lossy()
+                    .to_string();
+                ssh::create_user(&username, &shell, &home_dir)?;
+                match store.add_ssh_user(&username, &client, &shell, &home_dir, app.as_deref()) {
+                    Ok(user) => println!("usuario SSH creado: {} ({})", user.username, user.id),
+                    Err(e) => {
+                        let _ = ssh::delete_user(&username);
+                        return Err(e);
+                    }
+                }
+            }
+            SshSubcommand::UserList => {
+                for user in store.list_ssh_users()? {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        user.client_slug,
+                        user.app_slug.unwrap_or_default(),
+                        user.username,
+                        user.shell,
+                        user.home_dir
+                    );
+                }
+            }
+            SshSubcommand::UserEdit {
+                username,
+                client,
+                shell,
+                app,
+            } => {
+                let user = find_ssh_user(&store, &username)?;
+                if user.shell != shell {
+                    ssh::set_shell(&username, &shell)?;
+                }
+                store.update_ssh_user(&user.id, &client, &shell, app.as_deref())?;
+                println!("usuario SSH actualizado: {}", username);
+            }
+            SshSubcommand::UserDelete { username, yes } => {
+                require_yes(yes, "delete ssh user")?;
+                let user = find_ssh_user(&store, &username)?;
+                store.delete_ssh_user(&user.id)?;
+                ssh::delete_user(&username)?;
+                println!("usuario SSH eliminado: {}", username);
+            }
+            SshSubcommand::KeyAdd {
+                username,
+                label,
+                public_key,
+            } => {
+                let user = find_ssh_user(&store, &username)?;
+                let key = store.add_ssh_key(&user.id, &label, &public_key)?;
+                let keys = store.keys_for_user(&user.id)?;
+                ssh::sync_authorized_keys(&username, &user.home_dir, &keys)?;
+                println!("clave SSH creada: {} ({})", key.label, username);
+            }
+            SshSubcommand::KeyList { username } => {
+                let keys = store.list_ssh_keys()?;
+                let users = store.list_ssh_users()?;
+                for key in keys {
+                    let Some(user) = users.iter().find(|u| u.id == key.user_id) else {
+                        continue;
+                    };
+                    if username
+                        .as_deref()
+                        .is_some_and(|name| name != user.username)
+                    {
+                        continue;
+                    }
+                    println!("{}\t{}\t{}", user.username, key.label, key.public_key);
+                }
+            }
+            SshSubcommand::KeyDelete {
+                username,
+                label,
+                yes,
+            } => {
+                require_yes(yes, "delete ssh key")?;
+                let user = find_ssh_user(&store, &username)?;
+                let key = store
+                    .keys_for_user(&user.id)?
+                    .into_iter()
+                    .find(|key| key.label == label)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("clave no encontrada: {}", label))?;
+                store.delete_ssh_key(&key.id)?;
+                let keys = store.keys_for_user(&user.id)?;
+                ssh::sync_authorized_keys(&username, &user.home_dir, &keys)?;
+                println!("clave SSH eliminada: {} ({})", label, username);
+            }
         },
         Command::Caddy(cmd) => match cmd.command {
             CaddySubcommand::Bootstrap => {
@@ -291,9 +595,17 @@ fn main() -> Result<()> {
                     println!("import ya existía en {}", cfg.caddyfile_path.display());
                 }
             }
-            CaddySubcommand::Render => print!("{}", caddy::render_block(&store.list_apps()?, &store.list_domain_aliases()?)),
+            CaddySubcommand::Render => print!(
+                "{}",
+                caddy::render_block(&store.list_apps()?, &store.list_domain_aliases()?)
+            ),
             CaddySubcommand::Apply { reload } => {
-                caddy::apply(&cfg, &store.list_apps()?, &store.list_domain_aliases()?, reload)?;
+                caddy::apply(
+                    &cfg,
+                    &store.list_apps()?,
+                    &store.list_domain_aliases()?,
+                    reload,
+                )?;
                 println!(
                     "Caddy managed actualizado: {}",
                     cfg.caddy_managed_path.display()
@@ -411,6 +723,32 @@ fn main() -> Result<()> {
                 println!(
                     "grant aplicado: {}.* -> '{}'@'{}'",
                     database, username, host
+                );
+            }
+            DbSubcommand::GrantReassign {
+                server,
+                database,
+                username,
+                host,
+                client,
+                app,
+                env,
+            } => {
+                let grant = find_database_grant(&store, &server, &database, &username, &host)?;
+                store.reassign_database_grant(
+                    &grant.id,
+                    &client,
+                    app.as_deref(),
+                    env.as_deref(),
+                )?;
+                println!(
+                    "grant reasignado: {} '{}'@'{}' -> client={} app={} env={}",
+                    database,
+                    username,
+                    host,
+                    client,
+                    app.unwrap_or_else(|| "-".to_string()),
+                    env.unwrap_or(grant.env)
                 );
             }
             DbSubcommand::Provision {
@@ -590,4 +928,94 @@ fn resolve_password(password: Option<String>, generate: bool) -> Result<String> 
 
 fn print_secret(password: &str) {
     println!("password (mostrar una sola vez): {}", password);
+}
+
+fn require_yes(yes: bool, action: &str) -> Result<()> {
+    if !yes {
+        bail!("{} requiere --yes", action);
+    }
+    Ok(())
+}
+
+fn find_client(store: &Store, slug: &str) -> Result<Client> {
+    store
+        .list_clients()?
+        .into_iter()
+        .find(|client| client.slug == slug)
+        .ok_or_else(|| color_eyre::eyre::eyre!("cliente no encontrado: {}", slug))
+}
+
+fn find_app(store: &Store, client: &str, slug: &str) -> Result<HostingApp> {
+    store
+        .list_apps()?
+        .into_iter()
+        .find(|app| app.client_slug == client && app.slug == slug)
+        .ok_or_else(|| color_eyre::eyre::eyre!("app no encontrada: {}/{}", client, slug))
+}
+
+fn find_alias_by_domain(store: &Store, domain: &str) -> Result<DomainAlias> {
+    store
+        .list_domain_aliases()?
+        .into_iter()
+        .find(|alias| alias.domain == domain)
+        .ok_or_else(|| color_eyre::eyre::eyre!("alias no encontrado: {}", domain))
+}
+
+fn find_ssh_user(store: &Store, username: &str) -> Result<SshUser> {
+    store
+        .list_ssh_users()?
+        .into_iter()
+        .find(|user| user.username == username)
+        .ok_or_else(|| color_eyre::eyre::eyre!("usuario SSH no encontrado: {}", username))
+}
+
+fn find_database_grant(
+    store: &Store,
+    server: &str,
+    database: &str,
+    username: &str,
+    host: &str,
+) -> Result<DatabaseGrant> {
+    store
+        .list_database_grants()?
+        .into_iter()
+        .find(|grant| {
+            grant.server_name == server
+                && grant.db_name == database
+                && grant.username == username
+                && grant.host == host
+        })
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "grant no encontrado: server={} db={} user={} host={}",
+                server,
+                database,
+                username,
+                host
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn cli_defines_ssh_and_alias_subcommands() {
+        Cli::command().debug_assert();
+
+        let root = Cli::command();
+        assert!(root.get_subcommands().any(|cmd| cmd.get_name() == "ssh"));
+
+        let app = root
+            .get_subcommands()
+            .find(|cmd| cmd.get_name() == "app")
+            .expect("app command exists");
+        assert!(
+            app.get_subcommands()
+                .any(|cmd| cmd.get_name() == "alias-add")
+        );
+    }
 }

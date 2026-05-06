@@ -53,6 +53,7 @@ pub fn reset_password(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn grant_all(
     cfg: &Config,
     store: &Store,
@@ -90,6 +91,7 @@ pub fn grant_all(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn provision(
     cfg: &Config,
     store: &Store,
@@ -212,6 +214,7 @@ fn mariadb_reset_password(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mariadb_grant_all(
     cfg: &Config,
     store: &Store,

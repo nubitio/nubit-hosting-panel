@@ -2,7 +2,10 @@ use std::{fs, process::Command};
 
 use color_eyre::eyre::{Context, Result, eyre};
 
-use crate::{config::Config, store::{App, DomainAlias}};
+use crate::{
+    config::Config,
+    store::{App, DomainAlias},
+};
 
 pub fn render_block(apps: &[App], aliases: &[DomainAlias]) -> String {
     let mut out = String::new();
@@ -18,15 +21,23 @@ pub fn render_block(apps: &[App], aliases: &[DomainAlias]) -> String {
         } else {
             format!("{} {}", app.domain, extra.join(" "))
         };
+        let proxy = render_proxy(&app.upstream);
         out.push_str(&format!(
-            "# client: {client} app: {slug}\n{domains} {{\n  encode zstd gzip\n  reverse_proxy {upstream}\n}}\n\n",
+            "# client: {client} app: {slug}\n{domains} {{\n  encode zstd gzip\n{proxy}\n}}\n\n",
             client = app.client_slug,
             slug = app.slug,
             domains = domains,
-            upstream = app.upstream,
         ));
     }
     out
+}
+
+fn render_proxy(upstream: &str) -> String {
+    if upstream.starts_with("https://") {
+        format!("  reverse_proxy {upstream} {{\n    header_up Host {{upstream_hostport}}\n  }}")
+    } else {
+        format!("  reverse_proxy {upstream}")
+    }
 }
 
 pub fn bootstrap(cfg: &Config) -> Result<bool> {
@@ -132,18 +143,59 @@ mod tests {
 
     #[test]
     fn render_block_contains_app_proxy() {
-        let rendered = render_block(&[App {
-            id: "app-1".into(),
-            client_slug: "porteroseguro".into(),
-            slug: "web".into(),
-            domain: "porteroseguro.nubit.site".into(),
-            upstream: "tomcat_porteroseguro:8080".into(),
-            notes: None,
-            created_at: Utc::now(),
-        }], &[]);
+        let rendered = render_block(
+            &[App {
+                id: "app-1".into(),
+                client_slug: "porteroseguro".into(),
+                slug: "web".into(),
+                domain: "porteroseguro.nubit.site".into(),
+                upstream: "tomcat_porteroseguro:8080".into(),
+                notes: None,
+                created_at: Utc::now(),
+            }],
+            &[],
+        );
 
         assert!(rendered.contains("# This file is managed by hostingctl"));
         assert!(rendered.contains("porteroseguro.nubit.site"));
         assert!(rendered.contains("reverse_proxy tomcat_porteroseguro:8080"));
+    }
+
+    #[test]
+    fn render_block_sets_host_header_for_https_upstreams() {
+        let rendered = render_block(
+            &[App {
+                id: "app-1".into(),
+                client_slug: "external".into(),
+                slug: "api".into(),
+                domain: "api.nubit.site".into(),
+                upstream: "https://api.example.com".into(),
+                notes: None,
+                created_at: Utc::now(),
+            }],
+            &[],
+        );
+
+        assert!(rendered.contains("reverse_proxy https://api.example.com {"));
+        assert!(rendered.contains("header_up Host {upstream_hostport}"));
+    }
+
+    #[test]
+    fn render_block_keeps_http_upstreams_simple() {
+        let rendered = render_block(
+            &[App {
+                id: "app-1".into(),
+                client_slug: "external".into(),
+                slug: "api".into(),
+                domain: "api.nubit.site".into(),
+                upstream: "http://10.0.0.50:8080".into(),
+                notes: None,
+                created_at: Utc::now(),
+            }],
+            &[],
+        );
+
+        assert!(rendered.contains("reverse_proxy http://10.0.0.50:8080"));
+        assert!(!rendered.contains("header_up Host"));
     }
 }

@@ -78,7 +78,7 @@ pub fn sync_authorized_keys(username: &str, home_dir: &str, keys: &[SshKey]) -> 
             .args([
                 "-R",
                 &format!("{}:{}", username, username),
-                &ssh_dir.to_string_lossy().to_string(),
+                ssh_dir.to_string_lossy().as_ref(),
             ])
             .output();
     }

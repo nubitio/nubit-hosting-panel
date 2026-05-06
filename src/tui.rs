@@ -1,3 +1,7 @@
+#![allow(clippy::collapsible_if)]
+
+mod selection;
+
 use std::{fs, io, path::PathBuf};
 
 use color_eyre::eyre::Result;
@@ -21,7 +25,9 @@ use crate::{
     backup, caddy,
     config::Config,
     db, doctor, ssh,
-    store::{App as HostingApp, Client, DatabaseGrant, DbServer, DomainAlias, SshKey, SshUser, Store},
+    store::{
+        App as HostingApp, Client, DatabaseGrant, DbServer, DomainAlias, SshKey, SshUser, Store,
+    },
 };
 
 // ── System info ───────────────────────────────────────────────────────────────
@@ -269,6 +275,7 @@ enum FormKind {
     Provision,
     Backup,
     ResetPassword,
+    ReassignGrant,
     EditClient,
     EditApp,
     AddSshUser,
@@ -494,6 +501,11 @@ impl TuiState {
             .collect()
     }
 
+    fn selected_client(&self) -> Option<&Client> {
+        let clients = self.filtered_clients();
+        selection::selected(&clients, self.clients_table.selected())
+    }
+
     fn filtered_apps_view(&self) -> Vec<&HostingApp> {
         let q = self.filter_query.to_lowercase();
         self.apps
@@ -517,7 +529,11 @@ impl TuiState {
                 q.is_empty()
                     || u.username.to_lowercase().contains(&q)
                     || u.client_slug.to_lowercase().contains(&q)
-                    || u.app_slug.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                    || u.app_slug
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&q)
             })
             .collect()
     }
@@ -633,16 +649,18 @@ impl TuiState {
     }
 
     fn selected_ssh_user(&self) -> Option<&SshUser> {
-        self.ssh_users_table
-            .selected()
-            .and_then(|i| self.ssh_users.get(i))
+        let users = self.filtered_ssh_users_view();
+        selection::selected(&users, self.ssh_users_table.selected())
     }
 
-    /// Recalcula las opciones del selector "App" en formularios AddSshUser/EditSshUser
+    /// Recalcula las opciones del selector "App" basándose en el valor actual del campo Cliente.
     /// basándose en el valor actual del campo Cliente (campo 0).
     fn refresh_ssh_app_options(&mut self) {
         let is_ssh_user_form = if let Modal::Form { kind, .. } = &self.modal {
-            matches!(kind, FormKind::AddSshUser | FormKind::EditSshUser)
+            matches!(
+                kind,
+                FormKind::AddSshUser | FormKind::EditSshUser | FormKind::ReassignGrant
+            )
         } else {
             false
         };
@@ -651,7 +669,10 @@ impl TuiState {
         }
 
         let client_slug = if let Modal::Form { fields, .. } = &self.modal {
-            fields.first().map(|f| f.input.value.clone()).unwrap_or_default()
+            fields
+                .first()
+                .map(|f| f.input.value.clone())
+                .unwrap_or_default()
         } else {
             return;
         };
@@ -670,8 +691,7 @@ impl TuiState {
                     let current = app_field.input.value.clone();
                     app_field.options = new_opts.clone();
                     if !new_opts.contains(&current) {
-                        app_field.input.value =
-                            new_opts.first().cloned().unwrap_or_default();
+                        app_field.input.value = new_opts.first().cloned().unwrap_or_default();
                     }
                 }
             }
@@ -696,9 +716,8 @@ impl TuiState {
     }
 
     fn selected_app(&self) -> Option<&HostingApp> {
-        self.apps_table
-            .selected()
-            .and_then(|i| self.apps.get(i))
+        let apps = self.filtered_apps_view();
+        selection::selected(&apps, self.apps_table.selected())
     }
 
     fn selected_server(&self) -> Option<&DbServer> {
@@ -735,9 +754,7 @@ impl TuiState {
             .map(|s| s.name.clone())
             .unwrap_or_default();
         let prefill_client = self
-            .clients_table
-            .selected()
-            .and_then(|i| self.clients.get(i))
+            .selected_client()
             .map(|c| c.slug.clone())
             .unwrap_or_default();
 
@@ -801,8 +818,7 @@ impl TuiState {
                                 error: None,
                                 payload: app_id,
                             };
-                            self.status =
-                                format!("agregando alias para {app_name}");
+                            self.status = format!("agregando alias para {app_name}");
                         } else {
                             self.status =
                                 "Selecciona una app primero (↑↓ en panel superior)".to_string();
@@ -859,13 +875,11 @@ impl TuiState {
                         if !prefill_client.is_empty() {
                             client_field = client_field.prefill(&prefill_client);
                         }
-                        let app_opts = self.app_options_for_client(
-                            if prefill_client.is_empty() {
-                                client_opts.first().map(String::as_str).unwrap_or("")
-                            } else {
-                                &prefill_client
-                            },
-                        );
+                        let app_opts = self.app_options_for_client(if prefill_client.is_empty() {
+                            client_opts.first().map(String::as_str).unwrap_or("")
+                        } else {
+                            &prefill_client
+                        });
                         self.modal = Modal::Form {
                             title: " Agregar Usuario SSH ",
                             fields: vec![
@@ -980,6 +994,45 @@ impl TuiState {
         }
     }
 
+    fn open_reassign_grant(&mut self) {
+        let grants = self.filtered_grants();
+        let grant = self
+            .grants_table
+            .selected()
+            .and_then(|i| grants.get(i))
+            .copied();
+        if let Some(grant) = grant {
+            let client_opts = self.client_options();
+            let mut client_field = if client_opts.is_empty() {
+                FormField::req("Cliente", "ej: acme-corp")
+            } else {
+                FormField::select("Cliente", client_opts)
+            };
+            client_field = client_field.prefill(&grant.client_slug);
+            let mut app_field = FormField::select(
+                "App (opcional)",
+                self.app_options_for_client(&grant.client_slug),
+            );
+            if let Some(app) = &grant.app_slug {
+                app_field = app_field.prefill(app);
+            }
+            self.modal = Modal::Form {
+                title: " Reasignar Grant DB ",
+                fields: vec![
+                    client_field,
+                    FormField::req("Env", "prod").prefill(&grant.env),
+                    app_field,
+                ],
+                focus: 0,
+                kind: FormKind::ReassignGrant,
+                error: None,
+                payload: grant.id.clone(),
+            };
+        } else {
+            self.status = "Selecciona un grant en la tabla inferior primero".to_string();
+        }
+    }
+
     fn open_restore(&mut self) {
         if let Some(backup) = self
             .backups_table
@@ -1003,11 +1056,7 @@ impl TuiState {
     fn open_delete(&mut self) {
         match self.tab {
             ActiveTab::Clients => {
-                if let Some(client) = self
-                    .clients_table
-                    .selected()
-                    .and_then(|i| self.clients.get(i))
-                {
+                if let Some(client) = self.selected_client() {
                     self.modal = Modal::Confirm {
                         message: format!(
                             "Eliminar cliente '{}'?\nSe eliminarán también todas sus apps.",
@@ -1018,55 +1067,51 @@ impl TuiState {
                     };
                 }
             }
-            ActiveTab::Apps => {
-                match self.app_focus {
-                    AppFocus::Apps => {
-                        if let Some(app) =
-                            self.apps_table.selected().and_then(|i| self.apps.get(i))
-                        {
-                            let alias_count =
-                                self.aliases.iter().filter(|al| al.app_id == app.id).count();
-                            let alias_note = if alias_count > 0 {
-                                format!(" ({alias_count} alias también serán eliminados)")
-                            } else {
-                                String::new()
-                            };
-                            self.modal = Modal::Confirm {
-                                message: format!(
-                                    "Eliminar app '{}/{}'?{}",
-                                    app.client_slug, app.slug, alias_note
-                                ),
-                                kind: ConfirmKind::DeleteApp,
-                                payload: app.id.clone(),
-                            };
-                        }
-                    }
-                    AppFocus::Aliases => {
-                        let aliases = self.filtered_aliases();
-                        if let Some(alias) = self
-                            .aliases_table
-                            .selected()
-                            .and_then(|i| aliases.get(i))
-                            .copied()
-                        {
-                            let app_name = self
-                                .selected_app()
-                                .map(|a| format!("{}/{}", a.client_slug, a.slug))
-                                .unwrap_or_default();
-                            self.modal = Modal::Confirm {
-                                message: format!(
-                                    "Eliminar alias '{}' de '{}'?",
-                                    alias.domain, app_name
-                                ),
-                                kind: ConfirmKind::DeleteAlias,
-                                payload: alias.id.clone(),
-                            };
+            ActiveTab::Apps => match self.app_focus {
+                AppFocus::Apps => {
+                    if let Some(app) = self.selected_app() {
+                        let alias_count =
+                            self.aliases.iter().filter(|al| al.app_id == app.id).count();
+                        let alias_note = if alias_count > 0 {
+                            format!(" ({alias_count} alias también serán eliminados)")
                         } else {
-                            self.status = "Selecciona un alias primero (↑↓)".to_string();
-                        }
+                            String::new()
+                        };
+                        self.modal = Modal::Confirm {
+                            message: format!(
+                                "Eliminar app '{}/{}'?{}",
+                                app.client_slug, app.slug, alias_note
+                            ),
+                            kind: ConfirmKind::DeleteApp,
+                            payload: app.id.clone(),
+                        };
                     }
                 }
-            }
+                AppFocus::Aliases => {
+                    let aliases = self.filtered_aliases();
+                    if let Some(alias) = self
+                        .aliases_table
+                        .selected()
+                        .and_then(|i| aliases.get(i))
+                        .copied()
+                    {
+                        let app_name = self
+                            .selected_app()
+                            .map(|a| format!("{}/{}", a.client_slug, a.slug))
+                            .unwrap_or_default();
+                        self.modal = Modal::Confirm {
+                            message: format!(
+                                "Eliminar alias '{}' de '{}'?",
+                                alias.domain, app_name
+                            ),
+                            kind: ConfirmKind::DeleteAlias,
+                            payload: alias.id.clone(),
+                        };
+                    } else {
+                        self.status = "Selecciona un alias primero (↑↓)".to_string();
+                    }
+                }
+            },
             ActiveTab::Ssh => match self.ssh_focus {
                 SshFocus::Users => {
                     if let Some(user) = self.selected_ssh_user() {
@@ -1095,10 +1140,7 @@ impl TuiState {
                             .map(|u| u.username.as_str())
                             .unwrap_or("?");
                         self.modal = Modal::Confirm {
-                            message: format!(
-                                "Eliminar clave '{}' de '{}'?",
-                                key.label, user_name
-                            ),
+                            message: format!("Eliminar clave '{}' de '{}'?", key.label, user_name),
                             kind: ConfirmKind::DeleteSshKey,
                             payload: key.id.clone(),
                         };
@@ -1115,11 +1157,7 @@ impl TuiState {
         let client_opts = self.client_options();
         match self.tab {
             ActiveTab::Clients => {
-                if let Some(client) = self
-                    .clients_table
-                    .selected()
-                    .and_then(|i| self.clients.get(i))
-                {
+                if let Some(client) = self.selected_client() {
                     let id = client.id.clone();
                     self.modal = Modal::Form {
                         title: " Editar Cliente ",
@@ -1140,90 +1178,82 @@ impl TuiState {
                     self.status = "Selecciona un cliente primero (↑↓)".to_string();
                 }
             }
-            ActiveTab::Apps => {
-                match self.app_focus {
-                    AppFocus::Apps => {
-                        if let Some(app) = self.apps_table.selected().and_then(|i| self.apps.get(i)) {
-                            let id = app.id.clone();
-                            let current_client = app.client_slug.clone();
-                            let mut client_field = if client_opts.is_empty() {
-                                FormField::req("Cliente (slug)", "ej: acme-corp")
-                            } else {
-                                FormField::select("Cliente", client_opts)
-                            };
-                            client_field = client_field.prefill(&current_client);
-                            self.modal = Modal::Form {
-                                title: " Editar App ",
-                                fields: vec![
-                                    client_field,
-                                    FormField::req("App slug", "ej: web").prefill(&app.slug),
-                                    FormField::req("Dominio", "ej: acme.nubit.site")
-                                        .prefill(&app.domain),
-                                    FormField::req("Upstream", "ej: container:8080")
-                                        .prefill(&app.upstream),
-                                    FormField::opt("Notas", "observaciones internas...")
-                                        .prefill(&app.notes.clone().unwrap_or_default()),
-                                ],
-                                focus: 0,
-                                kind: FormKind::EditApp,
-                                error: None,
-                                payload: id,
-                            };
+            ActiveTab::Apps => match self.app_focus {
+                AppFocus::Apps => {
+                    if let Some(app) = self.selected_app() {
+                        let id = app.id.clone();
+                        let current_client = app.client_slug.clone();
+                        let mut client_field = if client_opts.is_empty() {
+                            FormField::req("Cliente (slug)", "ej: acme-corp")
                         } else {
-                            self.status = "Selecciona una app primero (↑↓)".to_string();
-                        }
-                    }
-                    AppFocus::Aliases => {
-                        self.status =
-                            "Los alias no se editan — elimínalo y agrega uno nuevo (d / a)"
-                                .to_string();
+                            FormField::select("Cliente", client_opts)
+                        };
+                        client_field = client_field.prefill(&current_client);
+                        self.modal = Modal::Form {
+                            title: " Editar App ",
+                            fields: vec![
+                                client_field,
+                                FormField::req("App slug", "ej: web").prefill(&app.slug),
+                                FormField::req("Dominio", "ej: acme.nubit.site")
+                                    .prefill(&app.domain),
+                                FormField::req("Upstream", "ej: container:8080")
+                                    .prefill(&app.upstream),
+                                FormField::opt("Notas", "observaciones internas...")
+                                    .prefill(&app.notes.clone().unwrap_or_default()),
+                            ],
+                            focus: 0,
+                            kind: FormKind::EditApp,
+                            error: None,
+                            payload: id,
+                        };
+                    } else {
+                        self.status = "Selecciona una app primero (↑↓)".to_string();
                     }
                 }
-            }
-            ActiveTab::Ssh => {
-                match self.ssh_focus {
-                    SshFocus::Users => {
-                        if let Some(user) = self.selected_ssh_user() {
-                            let id = user.id.clone();
-                            let current_client = user.client_slug.clone();
-                            let current_app = user.app_slug.clone();
-                            let shell_opts =
-                                ssh::SHELLS.iter().map(|s| s.to_string()).collect();
-                            let mut client_field = if client_opts.is_empty() {
-                                FormField::req("Cliente", "ej: acme-corp")
-                            } else {
-                                FormField::select("Cliente", client_opts)
-                            };
-                            client_field = client_field.prefill(&current_client);
-                            let app_opts = self.app_options_for_client(&current_client);
-                            let mut app_field =
-                                FormField::select("App (opcional)", app_opts);
-                            if let Some(ref a) = current_app {
-                                app_field = app_field.prefill(a);
-                            }
-                            self.modal = Modal::Form {
-                                title: " Editar Usuario SSH ",
-                                fields: vec![
-                                    client_field,
-                                    FormField::select("Shell", shell_opts)
-                                        .prefill(&user.shell),
-                                    app_field,
-                                ],
-                                focus: 0,
-                                kind: FormKind::EditSshUser,
-                                error: None,
-                                payload: id,
-                            };
+                AppFocus::Aliases => {
+                    self.status =
+                        "Los alias no se editan — elimínalo y agrega uno nuevo (d / a)".to_string();
+                }
+            },
+            ActiveTab::Ssh => match self.ssh_focus {
+                SshFocus::Users => {
+                    if let Some(user) = self.selected_ssh_user() {
+                        let id = user.id.clone();
+                        let current_client = user.client_slug.clone();
+                        let current_app = user.app_slug.clone();
+                        let shell_opts = ssh::SHELLS.iter().map(|s| s.to_string()).collect();
+                        let mut client_field = if client_opts.is_empty() {
+                            FormField::req("Cliente", "ej: acme-corp")
                         } else {
-                            self.status = "Selecciona un usuario primero (↑↓)".to_string();
+                            FormField::select("Cliente", client_opts)
+                        };
+                        client_field = client_field.prefill(&current_client);
+                        let app_opts = self.app_options_for_client(&current_client);
+                        let mut app_field = FormField::select("App (opcional)", app_opts);
+                        if let Some(ref a) = current_app {
+                            app_field = app_field.prefill(a);
                         }
-                    }
-                    SshFocus::Keys => {
-                        self.status =
-                            "Las claves no se editan — elimínala y agrega una nueva".to_string();
+                        self.modal = Modal::Form {
+                            title: " Editar Usuario SSH ",
+                            fields: vec![
+                                client_field,
+                                FormField::select("Shell", shell_opts).prefill(&user.shell),
+                                app_field,
+                            ],
+                            focus: 0,
+                            kind: FormKind::EditSshUser,
+                            error: None,
+                            payload: id,
+                        };
+                    } else {
+                        self.status = "Selecciona un usuario primero (↑↓)".to_string();
                     }
                 }
-            }
+                SshFocus::Keys => {
+                    self.status =
+                        "Las claves no se editan — elimínala y agrega una nueva".to_string();
+                }
+            },
             _ => {}
         }
     }
@@ -1307,12 +1337,11 @@ fn handle_main_key(state: &mut TuiState, code: KeyCode, store: &Store, cfg: &Con
         KeyCode::Up | KeyCode::Char('k') => state.nav_up(),
         KeyCode::Char('a') => state.open_add(),
         KeyCode::Char('d') => state.open_delete(),
-        KeyCode::Char('e')
-            if state.tab == ActiveTab::Apps || state.tab == ActiveTab::Clients =>
-        {
+        KeyCode::Char('e') if state.tab == ActiveTab::Apps || state.tab == ActiveTab::Clients => {
             state.open_edit()
         }
         KeyCode::Char('e') if state.tab == ActiveTab::Databases => state.open_reset_password(),
+        KeyCode::Char('m') if state.tab == ActiveTab::Databases => state.open_reassign_grant(),
         KeyCode::Char('c') if state.tab == ActiveTab::Apps || state.tab == ActiveTab::Dashboard => {
             state.modal = Modal::Confirm {
                 message: format!(
@@ -1468,7 +1497,12 @@ fn handle_result_key(state: &mut TuiState, code: KeyCode) {
 
 fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
     let (kind, data, payload, first_empty) = match &state.modal {
-        Modal::Form { kind, fields, payload, .. } => {
+        Modal::Form {
+            kind,
+            fields,
+            payload,
+            ..
+        } => {
             let data: Vec<String> = fields
                 .iter()
                 .map(|f| f.input.value.trim().to_string())
@@ -1609,9 +1643,33 @@ fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
                 },
             }
         }
+        FormKind::ReassignGrant => {
+            let app_slug = if data[2] == "(ninguna)" || data[2].is_empty() {
+                None
+            } else {
+                Some(data[2].as_str())
+            };
+            match store.reassign_database_grant(&payload, &data[0], app_slug, Some(&data[1])) {
+                Ok(()) => {
+                    state.modal = Modal::None;
+                    state.reload(store, cfg)?;
+                    state.status = format!("✓ grant reasignado a {}", data[0]);
+                    state.switch_tab(ActiveTab::Databases);
+                }
+                Err(e) => set_modal_error(&mut state.modal, e.to_string()),
+            }
+        }
         FormKind::EditClient => {
-            let email = if data[2].is_empty() { None } else { Some(data[2].as_str()) };
-            let notes = if data[3].is_empty() { None } else { Some(data[3].as_str()) };
+            let email = if data[2].is_empty() {
+                None
+            } else {
+                Some(data[2].as_str())
+            };
+            let notes = if data[3].is_empty() {
+                None
+            } else {
+                Some(data[3].as_str())
+            };
             match store.update_client(&payload, &data[0], &data[1], email, notes) {
                 Ok(()) => {
                     state.modal = Modal::None;
@@ -1623,7 +1681,11 @@ fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
             }
         }
         FormKind::EditApp => {
-            let notes = if data[4].is_empty() { None } else { Some(data[4].as_str()) };
+            let notes = if data[4].is_empty() {
+                None
+            } else {
+                Some(data[4].as_str())
+            };
             match store.update_app(&payload, &data[0], &data[1], &data[2], &data[3], notes) {
                 Ok(()) => {
                     state.modal = Modal::None;
@@ -1812,7 +1874,11 @@ fn try_confirm(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> 
                 state.modal = Modal::Result {
                     title: "✓ Caddy Aplicado".to_string(),
                     lines: vec![
-                        format!("{} apps ({} aliases) aplicados.", state.apps.len(), state.aliases.len()),
+                        format!(
+                            "{} apps ({} aliases) aplicados.",
+                            state.apps.len(),
+                            state.aliases.len()
+                        ),
                         String::new(),
                         format!("Managed: {}", cfg.caddy_managed_path.display()),
                     ],
@@ -1869,12 +1935,36 @@ fn rand_password() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 32)
 }
 
+struct TerminalRestoreGuard {
+    active: bool,
+}
+
+impl TerminalRestoreGuard {
+    fn new() -> Self {
+        Self { active: true }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 pub fn run(store: &Store, cfg: &Config) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    let mut restore_guard = TerminalRestoreGuard::new();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut state = TuiState::load(store, cfg)?;
@@ -1923,6 +2013,7 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    restore_guard.disarm();
     result
 }
 
@@ -1990,7 +2081,10 @@ fn draw_tabs(frame: &mut Frame, state: &TuiState, area: Rect) {
 fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
     let (msg, style) = if state.filter_active {
         (
-            format!("  / filtrar: {}▌   Enter: confirmar   Esc: limpiar", state.filter_query),
+            format!(
+                "  / filtrar: {}▌   Enter: confirmar   Esc: limpiar",
+                state.filter_query
+            ),
             Style::default().fg(Color::Cyan),
         )
     } else if !state.filter_query.is_empty() {
@@ -2010,20 +2104,36 @@ fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
         (state.status.clone(), Style::default().fg(Color::DarkGray))
     } else {
         let hint = match state.tab {
-            ActiveTab::Clients => "  1-6: tab   ↑↓: nav   a: add   e: edit   d: delete   /: filtrar   r: refresh   q: quit",
+            ActiveTab::Clients => {
+                "  1-6: tab   ↑↓: nav   a: add   e: edit   d: delete   /: filtrar   r: refresh   q: quit"
+            }
             ActiveTab::Apps => match state.app_focus {
-                AppFocus::Apps    => "  Tab: aliases   ↑↓: nav   a: add   e: edit   d: delete   /: filtrar   c: caddy   r: refresh   q: quit",
-                AppFocus::Aliases => "  Tab: apps   ↑↓: nav   a: add alias   d: delete alias   c: caddy   r: refresh   q: quit",
+                AppFocus::Apps => {
+                    "  Tab: aliases   ↑↓: nav   a: add   e: edit   d: delete   /: filtrar   c: caddy   r: refresh   q: quit"
+                }
+                AppFocus::Aliases => {
+                    "  Tab: apps   ↑↓: nav   a: add alias   d: delete alias   c: caddy   r: refresh   q: quit"
+                }
             },
             ActiveTab::Databases => match state.db_focus {
-                DbFocus::Servers => "  Tab: foco grants   ↑↓: nav   a: add server   p: provisionar   r: refresh   q: quit",
-                DbFocus::Grants  => "  Tab: foco servers   ↑↓: nav   e: reset password   r: refresh   q: quit",
+                DbFocus::Servers => {
+                    "  Tab: foco grants   ↑↓: nav   a: add server   p: provisionar   r: refresh   q: quit"
+                }
+                DbFocus::Grants => {
+                    "  Tab: foco servers   ↑↓: nav   e: reset password   m: mover/reasignar   r: refresh   q: quit"
+                }
             },
-            ActiveTab::Backups     => "  1-6: tab   ↑↓: nav   a: nuevo backup   Enter: restaurar   r: refresh   q: quit",
-            ActiveTab::Dashboard   => "  1-6: tab   r: refresh   q: quit",
+            ActiveTab::Backups => {
+                "  1-6: tab   ↑↓: nav   a: nuevo backup   Enter: restaurar   r: refresh   q: quit"
+            }
+            ActiveTab::Dashboard => "  1-6: tab   r: refresh   q: quit",
             ActiveTab::Ssh => match state.ssh_focus {
-                SshFocus::Users => "  Tab: claves   ↑↓: nav   a: add user   e: edit   d: delete   /: filtrar   r: refresh   q: quit",
-                SshFocus::Keys  => "  Tab: users   ↑↓: nav   a: add clave   d: delete clave   r: refresh   q: quit",
+                SshFocus::Users => {
+                    "  Tab: claves   ↑↓: nav   a: add user   e: edit   d: delete   /: filtrar   r: refresh   q: quit"
+                }
+                SshFocus::Keys => {
+                    "  Tab: users   ↑↓: nav   a: add clave   d: delete clave   r: refresh   q: quit"
+                }
             },
         };
         (hint.to_string(), Style::default().fg(Color::DarkGray))
@@ -2221,11 +2331,11 @@ fn draw_clients(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         ],
     )
     .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Clients ({}){}  / para filtrar ", state.clients.len(), filter_indicator)),
-    )
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Clients ({}){}  / para filtrar ",
+        state.clients.len(),
+        filter_indicator
+    )))
     .row_highlight_style(
         Style::default()
             .bg(Color::DarkGray)
@@ -2252,7 +2362,11 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         String::new()
     };
     let header = Row::new(vec!["", "Client", "App", "Domain", "Upstream", "Created"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
         .height(1);
     let rows: Vec<Row> = filtered_apps
         .iter()
@@ -2283,10 +2397,15 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     let apps_title = if apps_focused {
         format!(
             " Apps ({}){}  ● — a: add  e: edit  d: delete  Tab: aliases ",
-            state.apps.len(), filter_indicator
+            state.apps.len(),
+            filter_indicator
         )
     } else {
-        format!(" Apps ({}){}  — Tab: focus  /: filtrar ", state.apps.len(), filter_indicator)
+        format!(
+            " Apps ({}){}  — Tab: focus  /: filtrar ",
+            state.apps.len(),
+            filter_indicator
+        )
     };
     let table = Table::new(
         rows,
@@ -2304,9 +2423,17 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(apps_title)
-            .border_style(if apps_focused { focused_style } else { normal_style }),
+            .border_style(if apps_focused {
+                focused_style
+            } else {
+                normal_style
+            }),
     )
-    .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_stateful_widget(table, chunks[0], &mut state.apps_table);
 
     // ── Panel aliases ──────────────────────────────────────────────
@@ -2319,17 +2446,23 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     let aliases_title = match (&selected_app_name, aliases_focused) {
         (Some(name), true) => format!(
             " Dominios Alias ● {} ({}) — a: add  d: delete ",
-            name, filtered_aliases.len()
+            name,
+            filtered_aliases.len()
         ),
         (Some(name), false) => format!(
             " Dominios Alias {} ({}) — Tab: focus ",
-            name, filtered_aliases.len()
+            name,
+            filtered_aliases.len()
         ),
         (None, _) => " Dominios Alias — selecciona una app ↑↓ ".to_string(),
     };
 
     let alias_header = Row::new(vec!["Dominio Alias", "Agregado"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
         .height(1);
     let alias_rows: Vec<Row> = filtered_aliases
         .iter()
@@ -2349,9 +2482,17 @@ fn draw_apps(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(aliases_title)
-            .border_style(if aliases_focused { focused_style } else { normal_style }),
+            .border_style(if aliases_focused {
+                focused_style
+            } else {
+                normal_style
+            }),
     )
-    .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_stateful_widget(aliases_table, chunks[1], &mut state.aliases_table);
 }
 
@@ -2536,13 +2677,15 @@ fn draw_ssh(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     let focused_style = Style::default().fg(Color::Cyan);
     let normal_style = Style::default().fg(Color::DarkGray);
 
-    let user_header = Row::new(vec!["Cliente", "App", "Username", "Shell", "Home Dir", "Creado"])
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .height(1);
+    let user_header = Row::new(vec![
+        "Cliente", "App", "Username", "Shell", "Home Dir", "Creado",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+    .height(1);
     let user_rows: Vec<Row> = state
         .ssh_users
         .iter()
@@ -2581,7 +2724,11 @@ fn draw_ssh(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(users_title)
-            .border_style(if users_focused { focused_style } else { normal_style }),
+            .border_style(if users_focused {
+                focused_style
+            } else {
+                normal_style
+            }),
     )
     .row_highlight_style(
         Style::default()
@@ -2600,11 +2747,9 @@ fn draw_ssh(frame: &mut Frame, state: &mut TuiState, area: Rect) {
             name,
             filtered_keys.len()
         ),
-        (Some(name), false) => format!(
-            " SSH Keys {} ({}) — Tab: focus ",
-            name,
-            filtered_keys.len()
-        ),
+        (Some(name), false) => {
+            format!(" SSH Keys {} ({}) — Tab: focus ", name, filtered_keys.len())
+        }
         (None, _) => " SSH Keys — selecciona un usuario ↑↓ ".to_string(),
     };
 
@@ -2643,7 +2788,11 @@ fn draw_ssh(frame: &mut Frame, state: &mut TuiState, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(keys_title)
-            .border_style(if keys_focused { focused_style } else { normal_style }),
+            .border_style(if keys_focused {
+                focused_style
+            } else {
+                normal_style
+            }),
     )
     .row_highlight_style(
         Style::default()
@@ -2652,7 +2801,6 @@ fn draw_ssh(frame: &mut Frame, state: &mut TuiState, area: Rect) {
     );
     frame.render_stateful_widget(keys_table, chunks[1], &mut state.ssh_keys_table);
 }
-
 
 // ── Modal rendering ───────────────────────────────────────────────────────────
 

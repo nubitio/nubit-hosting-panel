@@ -49,10 +49,10 @@ pub fn build(store: &Store) -> Result<HostingExport> {
 
 pub fn write(store: &Store, path: &Path) -> Result<HostingExport> {
     let export = build(store)?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     fs::write(path, serde_json::to_string_pretty(&export)?)?;
     Ok(export)

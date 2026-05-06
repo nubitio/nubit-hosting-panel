@@ -46,8 +46,7 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     // --prefix apunta un nivel arriba de /bin (ej: /usr/local si binario en /usr/local/bin)
     let prefix = bin_dir.parent().unwrap_or(bin_dir);
 
-    let install_url =
-        format!("https://github.com/{REPO}/releases/latest/download/install.sh");
+    let install_url = format!("https://github.com/{REPO}/releases/latest/download/install.sh");
     let cmd = format!(
         "curl -fsSL '{}' | sh -s -- --prefix='{}'",
         install_url,
@@ -86,8 +85,7 @@ fn fetch_latest_tag() -> Result<String> {
     }
 
     let body = String::from_utf8_lossy(&output.stdout);
-    extract_tag(&body)
-        .ok_or_else(|| eyre!("no se encontró tag_name en la respuesta de GitHub"))
+    extract_tag(&body).ok_or_else(|| eyre!("no se encontró tag_name en la respuesta de GitHub"))
 }
 
 /// Extrae el valor de "tag_name" de la respuesta JSON de la API de GitHub.

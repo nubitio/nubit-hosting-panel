@@ -102,6 +102,7 @@ pub fn create_login(cfg: &Config, server: &DbServer, username: &str, password: &
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn grant_dbo(
     cfg: &Config,
     store: &Store,

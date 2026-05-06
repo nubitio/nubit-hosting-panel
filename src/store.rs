@@ -85,6 +85,7 @@ pub struct Store {
 /// Para agregar schema nuevo:
 ///   1. push una nueva entrada a este array
 ///   2. el binario aplicará automáticamente solo las migraciones pendientes
+///
 /// NO modificar migraciones existentes.
 const MIGRATIONS: &[&str] = &[
     // v1 — schema inicial
@@ -219,9 +220,9 @@ impl Store {
     }
 
     pub fn list_clients(&self) -> Result<Vec<Client>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, slug, name, email, notes, created_at FROM clients ORDER BY slug")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, slug, name, email, notes, created_at FROM clients ORDER BY slug",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(Client {
                 id: row.get(0)?,
@@ -439,6 +440,7 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_grant(
         &self,
         server_id: &str,
@@ -576,8 +578,36 @@ impl Store {
         Ok(())
     }
 
+    pub fn reassign_database_grant(
+        &self,
+        id: &str,
+        client_slug: &str,
+        app_slug: Option<&str>,
+        env: Option<&str>,
+    ) -> Result<()> {
+        validate_slug(client_slug)?;
+        if let Some(env) = env {
+            validate_slug(env)?;
+        }
+        let client_id = self.client_id(client_slug)?;
+        let app_id = match app_slug {
+            Some(app) => Some(self.app_id(client_slug, app)?),
+            None => None,
+        };
+        let changed = self.conn.execute(
+            "UPDATE database_grants SET client_id = ?1, app_id = ?2, env = COALESCE(?3, env) WHERE id = ?4",
+            params![client_id, app_id, env, id],
+        )?;
+        if changed == 0 {
+            bail!("grant DB no encontrado: {}", id);
+        }
+        Ok(())
+    }
+
     pub fn delete_ssh_user(&self, id: &str) -> Result<()> {
-        let changed = self.conn.execute("DELETE FROM ssh_users WHERE id = ?1", [id])?;
+        let changed = self
+            .conn
+            .execute("DELETE FROM ssh_users WHERE id = ?1", [id])?;
         if changed == 0 {
             bail!("usuario SSH no encontrado: {}", id);
         }
@@ -632,7 +662,9 @@ impl Store {
     }
 
     pub fn delete_ssh_key(&self, id: &str) -> Result<()> {
-        let changed = self.conn.execute("DELETE FROM ssh_keys WHERE id = ?1", [id])?;
+        let changed = self
+            .conn
+            .execute("DELETE FROM ssh_keys WHERE id = ?1", [id])?;
         if changed == 0 {
             bail!("clave SSH no encontrada: {}", id);
         }
@@ -651,7 +683,12 @@ impl Store {
         };
         self.conn.execute(
             "INSERT INTO domain_aliases (id, app_id, domain, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![alias.id, alias.app_id, alias.domain, alias.created_at.to_rfc3339()],
+            params![
+                alias.id,
+                alias.app_id,
+                alias.domain,
+                alias.created_at.to_rfc3339()
+            ],
         )?;
         Ok(alias)
     }
@@ -661,21 +698,6 @@ impl Store {
             "SELECT id, app_id, domain, created_at FROM domain_aliases ORDER BY app_id, domain",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(DomainAlias {
-                id: row.get(0)?,
-                app_id: row.get(1)?,
-                domain: row.get(2)?,
-                created_at: parse_dt(row.get::<_, String>(3)?)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn aliases_for_app(&self, app_id: &str) -> Result<Vec<DomainAlias>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, app_id, domain, created_at FROM domain_aliases WHERE app_id = ?1 ORDER BY domain",
-        )?;
-        let rows = stmt.query_map([app_id], |row| {
             Ok(DomainAlias {
                 id: row.get(0)?,
                 app_id: row.get(1)?,
@@ -810,6 +832,41 @@ mod tests {
         Store::open(&tmp).unwrap();
         // opening again must not fail
         Store::open(&tmp).unwrap();
+    }
+
+    #[test]
+    fn reassign_database_grant_moves_client_and_app_metadata() {
+        let tmp = tempfile();
+        let store = Store::open(&tmp).unwrap();
+        let original = store.add_client("original", "Original", None).unwrap();
+        let target = store.add_client("target", "Target", None).unwrap();
+        store
+            .add_app("target", "web", "target.test", "target:8080")
+            .unwrap();
+        let server = store
+            .add_db_server("mariadb", "mariadb", "127.0.0.1", 3306)
+            .unwrap();
+        store
+            .record_grant(
+                &server.id,
+                &original.slug,
+                None,
+                "prod",
+                "wrong_db",
+                "wrong_user",
+                "%",
+            )
+            .unwrap();
+        let grant = store.list_database_grants().unwrap().remove(0);
+
+        store
+            .reassign_database_grant(&grant.id, &target.slug, Some("web"), Some("staging"))
+            .unwrap();
+
+        let grant = store.list_database_grants().unwrap().remove(0);
+        assert_eq!(grant.client_slug, "target");
+        assert_eq!(grant.app_slug.as_deref(), Some("web"));
+        assert_eq!(grant.env, "staging");
     }
 
     fn tempfile() -> std::path::PathBuf {

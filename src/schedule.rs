@@ -114,7 +114,13 @@ fn systemctl_property(unit: &str, property: &str) -> Result<String> {
     let raw = String::from_utf8_lossy(&out.stdout);
     raw.lines()
         .find(|l| l.starts_with(property))
-        .map(|l| l.splitn(2, '=').nth(1).unwrap_or("").trim().to_string())
+        .map(|l| {
+            l.split_once('=')
+                .map(|(_, value)| value)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
         .ok_or_else(|| eyre!("property not found"))
 }
 
