@@ -93,6 +93,56 @@ pub fn spawn_logs(container: &str, tail: usize, follow: bool) -> io::Result<std:
         .spawn()
 }
 
+pub fn ensure_network(network: &str) -> Result<()> {
+    let exists = Command::new("docker")
+        .arg("network")
+        .arg("inspect")
+        .arg(network)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if exists.success() {
+        return Ok(());
+    }
+
+    let created = Command::new("docker")
+        .arg("network")
+        .arg("create")
+        .arg(network)
+        .status()?;
+    if !created.success() {
+        bail!("docker network create falló para {network}");
+    }
+    Ok(())
+}
+
+pub fn compose_up(project_dir: &std::path::Path) -> Result<()> {
+    let status = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(project_dir.join("compose.yml"))
+        .arg("up")
+        .arg("-d")
+        .status()?;
+    if !status.success() {
+        bail!("docker compose up falló en {}", project_dir.display());
+    }
+    Ok(())
+}
+
+pub fn compose_pull(project_dir: &std::path::Path) -> Result<()> {
+    let status = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(project_dir.join("compose.yml"))
+        .arg("pull")
+        .status()?;
+    if !status.success() {
+        bail!("docker compose pull falló en {}", project_dir.display());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

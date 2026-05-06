@@ -33,6 +33,7 @@ use crate::{
     store::{
         App as HostingApp, Client, DatabaseGrant, DbServer, DomainAlias, SshKey, SshUser, Store,
     },
+    wp,
 };
 
 // ── System info ───────────────────────────────────────────────────────────────
@@ -287,6 +288,8 @@ enum FormKind {
     AddSshKey,
     EditSshUser,
     AddAlias,
+    WpStart,
+    WpMigration,
 }
 
 #[derive(Clone, Copy)]
@@ -320,8 +323,26 @@ enum Modal {
         title: String,
         lines: Vec<String>,
     },
+    Job(JobModal),
     Logs(LogsModal),
     Shell(Box<ShellModal>),
+}
+
+enum JobEvent {
+    Line(String),
+    Done {
+        success: bool,
+        title: String,
+        lines: Vec<String>,
+    },
+}
+
+struct JobModal {
+    title: String,
+    lines: Vec<String>,
+    done: bool,
+    success: bool,
+    rx: mpsc::Receiver<JobEvent>,
 }
 
 struct LogsModal {
@@ -987,6 +1008,53 @@ impl TuiState {
         };
     }
 
+    fn open_wp_provision(&mut self) {
+        let server_opts = self.server_options();
+        let client_opts = self.client_options();
+        let prefill_client = self
+            .selected_app()
+            .map(|a| a.client_slug.clone())
+            .or_else(|| self.selected_client().map(|c| c.slug.clone()))
+            .unwrap_or_default();
+        let prefill_server = self
+            .selected_server()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| server_opts.first().cloned().unwrap_or_default());
+
+        let mut client_field = if client_opts.is_empty() {
+            FormField::req("Cliente", "ej: acme-corp")
+        } else {
+            FormField::select("Cliente", client_opts)
+        };
+        if !prefill_client.is_empty() {
+            client_field = client_field.prefill(&prefill_client);
+        }
+
+        let mut server_field = if server_opts.is_empty() {
+            FormField::req("DB Server", "ej: mariadb")
+        } else {
+            FormField::select("DB Server", server_opts)
+        };
+        if !prefill_server.is_empty() {
+            server_field = server_field.prefill(&prefill_server);
+        }
+
+        self.modal = Modal::Form {
+            title: " Provisionar WordPress ",
+            fields: vec![
+                client_field,
+                FormField::req("App slug", "ej: web"),
+                FormField::req("Dominio", "ej: cliente.com"),
+                server_field,
+                FormField::select("Mode", vec!["fresh".to_string(), "existing".to_string()]),
+            ],
+            focus: 0,
+            kind: FormKind::WpStart,
+            error: None,
+            payload: String::new(),
+        };
+    }
+
     fn open_reset_password(&mut self) {
         let grants = self.filtered_grants();
         let grant = self
@@ -1088,8 +1156,27 @@ impl TuiState {
         }
     }
 
-    fn poll_modal_streams(&mut self) {
+    fn poll_modal_streams(&mut self, store: &Store, cfg: &Config) {
+        let mut should_reload = false;
         match &mut self.modal {
+            Modal::Job(job) => {
+                while let Ok(event) = job.rx.try_recv() {
+                    match event {
+                        JobEvent::Line(line) => job.lines.push(line),
+                        JobEvent::Done {
+                            success,
+                            title,
+                            lines,
+                        } => {
+                            job.done = true;
+                            job.success = success;
+                            job.title = title;
+                            job.lines.extend(lines);
+                            should_reload = success;
+                        }
+                    }
+                }
+            }
             Modal::Logs(logs) => {
                 if !logs.paused {
                     while let Ok(line) = logs.rx.try_recv() {
@@ -1106,6 +1193,10 @@ impl TuiState {
                 }
             }
             _ => {}
+        }
+        if should_reload {
+            let _ = self.reload(store, cfg);
+            self.switch_tab(ActiveTab::Apps);
         }
     }
 
@@ -1436,6 +1527,7 @@ fn handle_main_key(
         }
         KeyCode::Char('l') if state.tab == ActiveTab::Apps => state.open_logs(),
         KeyCode::Char('s') if state.tab == ActiveTab::Apps => state.open_shell(area),
+        KeyCode::Char('w') if state.tab == ActiveTab::Apps => state.open_wp_provision(),
         KeyCode::Char('p') if state.tab == ActiveTab::Databases => state.open_provision(),
         KeyCode::Enter if state.tab == ActiveTab::Backups => state.open_restore(),
         KeyCode::Char('r') => {
@@ -1579,6 +1671,14 @@ fn handle_result_key(state: &mut TuiState, code: KeyCode) {
     }
 }
 
+fn handle_job_key(state: &mut TuiState, code: KeyCode) {
+    if let Modal::Job(job) = &state.modal {
+        if job.done && matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+            state.modal = Modal::None;
+        }
+    }
+}
+
 fn handle_logs_key(state: &mut TuiState, code: KeyCode) {
     if let Modal::Logs(logs) = &mut state.modal {
         if logs.filter_active {
@@ -1705,6 +1805,66 @@ fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
             }
             Err(e) => set_modal_error(&mut state.modal, e.to_string()),
         },
+        FormKind::WpStart => {
+            let mode = match wp::ProvisionMode::parse(&data[4]) {
+                Ok(mode) => mode,
+                Err(e) => {
+                    set_modal_error(&mut state.modal, e.to_string());
+                    return Ok(());
+                }
+            };
+            match mode {
+                wp::ProvisionMode::Fresh => {
+                    let opts =
+                        wp_options_from_base(cfg, &data[0], &data[1], &data[2], &data[3], mode);
+                    let title = format!(" WordPress {}/{} ", opts.client, opts.slug);
+                    state.modal = spawn_wp_job(cfg.clone(), opts, title);
+                }
+                wp::ProvisionMode::Existing => {
+                    state.modal = Modal::Form {
+                        title: " Migrar WordPress ",
+                        fields: vec![
+                            FormField::opt("Bundle", "backup.tar.gz/.zip recomendado"),
+                            FormField::opt("Archive", "files.tar.gz/.zip override"),
+                            FormField::opt("Dump", "database.sql.gz override"),
+                            FormField::select(
+                                "Reuse existing files",
+                                vec!["no".to_string(), "yes".to_string()],
+                            ),
+                            FormField::opt("Old domain", "viejo.com opcional"),
+                        ],
+                        focus: 0,
+                        kind: FormKind::WpMigration,
+                        error: None,
+                        payload: encode_wp_base(&data[0], &data[1], &data[2], &data[3]),
+                    };
+                }
+            }
+        }
+        FormKind::WpMigration => {
+            let Some((client, slug, domain, db_server)) = decode_wp_base(&payload) else {
+                set_modal_error(
+                    &mut state.modal,
+                    "payload inválido para migración WP".to_string(),
+                );
+                return Ok(());
+            };
+            let mut opts = wp_options_from_base(
+                cfg,
+                &client,
+                &slug,
+                &domain,
+                &db_server,
+                wp::ProvisionMode::Existing,
+            );
+            opts.bundle = optional_path(&data[0]);
+            opts.archive = optional_path(&data[1]);
+            opts.dump = optional_path(&data[2]);
+            opts.reuse_existing_files = data[3] == "yes";
+            opts.old_domain = optional_string(&data[4]);
+            let title = format!(" WordPress {}/{} ", opts.client, opts.slug);
+            state.modal = spawn_wp_job(cfg.clone(), opts, title);
+        }
         FormKind::AddDbServer => {
             let port: u16 = data[3]
                 .parse()
@@ -2087,6 +2247,128 @@ fn rand_password() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 32)
 }
 
+fn optional_path(value: &str) -> Option<PathBuf> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value.trim()))
+    }
+}
+
+fn optional_string(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.trim().to_string())
+    }
+}
+
+fn wp_options_from_base(
+    cfg: &Config,
+    client: &str,
+    slug: &str,
+    domain: &str,
+    db_server: &str,
+    mode: wp::ProvisionMode,
+) -> wp::ProvisionOptions {
+    wp::ProvisionOptions {
+        client: client.to_string(),
+        slug: slug.to_string(),
+        domain: domain.to_string(),
+        db_server: db_server.to_string(),
+        mode,
+        bundle: None,
+        archive: None,
+        dump: None,
+        reuse_existing_files: false,
+        old_domain: None,
+        sites_dir: cfg.wp_sites_dir.clone(),
+        network: cfg.wp_network.clone(),
+        image: cfg.wp_image.clone(),
+        cli_image: cfg.wp_cli_image.clone(),
+        db_user_host: "%".to_string(),
+        wp_db_host: None,
+        apply_caddy: true,
+        reload_caddy: true,
+    }
+}
+
+fn encode_wp_base(client: &str, slug: &str, domain: &str, db_server: &str) -> String {
+    [client, slug, domain, db_server].join("\n")
+}
+
+fn decode_wp_base(payload: &str) -> Option<(String, String, String, String)> {
+    let mut parts = payload.lines();
+    Some((
+        parts.next()?.to_string(),
+        parts.next()?.to_string(),
+        parts.next()?.to_string(),
+        parts.next()?.to_string(),
+    ))
+}
+
+fn spawn_wp_job(cfg: Config, opts: wp::ProvisionOptions, title: String) -> Modal {
+    let (tx, rx) = mpsc::channel();
+    let initial_lines = vec![
+        format!("cliente/app: {}/{}", opts.client, opts.slug),
+        format!("domain:      {}", opts.domain),
+        format!("db server:   {}", opts.db_server),
+        format!("mode:        {:?}", opts.mode),
+        format!("image:       {}", opts.image),
+        "iniciando provision async...".to_string(),
+    ];
+    std::thread::spawn(move || {
+        let _ = tx.send(JobEvent::Line("abriendo store...".to_string()));
+        let store = match Store::open(&cfg.db_path()) {
+            Ok(store) => store,
+            Err(e) => {
+                let _ = tx.send(JobEvent::Done {
+                    success: false,
+                    title: "✗ WordPress falló".to_string(),
+                    lines: vec![format!("error abriendo store: {e}")],
+                });
+                return;
+            }
+        };
+        let _ = tx.send(JobEvent::Line("provisionando WordPress...".to_string()));
+        match wp::provision(&cfg, &store, opts) {
+            Ok(summary) => {
+                let _ = tx.send(JobEvent::Done {
+                    success: true,
+                    title: "✓ WordPress Provisionado".to_string(),
+                    lines: vec![
+                        format!("Site dir:  {}", summary.site_dir.display()),
+                        format!("Compose:   {}", summary.compose_file.display()),
+                        format!("HTML:      {}", summary.html_dir.display()),
+                        format!("Container: {}", summary.container),
+                        format!("Upstream:  {}", summary.upstream),
+                        format!("Database:  {}", summary.database),
+                        format!("Usuario:   {}", summary.username),
+                        String::new(),
+                        format!("Password: {}", summary.password),
+                        String::new(),
+                        "Guarda el password, no se mostrará de nuevo.".to_string(),
+                    ],
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(JobEvent::Done {
+                    success: false,
+                    title: "✗ WordPress falló".to_string(),
+                    lines: vec![e.to_string()],
+                });
+            }
+        }
+    });
+    Modal::Job(JobModal {
+        title,
+        lines: initial_lines,
+        done: false,
+        success: false,
+        rx,
+    })
+}
+
 fn spawn_logs_modal(app: &HostingApp) -> Result<LogsModal> {
     let container = docker::container_name_from_upstream(&app.upstream)
         .ok_or_else(|| color_eyre::eyre::eyre!("app no apunta a contenedor local"))?;
@@ -2254,7 +2536,7 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
             state.sys_info = load_sys_info();
             state.last_sys_refresh = now;
         }
-        state.poll_modal_streams();
+        state.poll_modal_streams(store, cfg);
 
         terminal.draw(|frame| draw(frame, &mut state))?;
 
@@ -2282,6 +2564,10 @@ pub fn run(store: &Store, cfg: &Config) -> Result<()> {
                         }
                         Modal::Result { .. } => {
                             handle_result_key(&mut state, key.code);
+                            Ok(())
+                        }
+                        Modal::Job(_) => {
+                            handle_job_key(&mut state, key.code);
                             Ok(())
                         }
                         Modal::Logs(_) => {
@@ -2397,7 +2683,7 @@ fn draw_statusbar(frame: &mut Frame, state: &TuiState, area: Rect) {
             }
             ActiveTab::Apps => match state.app_focus {
                 AppFocus::Apps => {
-                    "  Tab: aliases   ↑↓: nav   a/e/d   l: logs   s: shell   /: filtrar   c: caddy   r: refresh   q: quit"
+                    "  Tab: aliases   ↑↓: nav   a/e/d   w: wp   l: logs   s: shell   /: filtrar   c: caddy   r: refresh   q: quit"
                 }
                 AppFocus::Aliases => {
                     "  Tab: apps   ↑↓: nav   a: add alias   d: delete alias   c: caddy   r: refresh   q: quit"
@@ -3213,9 +3499,68 @@ fn draw_modal(frame: &mut Frame, modal: &mut Modal, area: Rect) {
             frame.render_widget(Clear, popup);
             draw_result(frame, title, lines, popup);
         }
+        Modal::Job(job) => draw_job_modal(frame, job, area),
         Modal::Logs(logs) => draw_logs_modal(frame, logs, area),
         Modal::Shell(shell) => draw_shell_modal(frame, shell, area),
     }
+}
+
+fn draw_job_modal(frame: &mut Frame, job: &JobModal, area: Rect) {
+    let popup = centered_rect(76, area.height.saturating_sub(8).max(12), area);
+    frame.render_widget(Clear, popup);
+    let border = if job.done {
+        if job.success {
+            Color::Green
+        } else {
+            Color::Red
+        }
+    } else {
+        Color::Yellow
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(job.title.clone())
+        .border_style(Style::default().fg(border));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let visible: Vec<Line> = job
+        .lines
+        .iter()
+        .rev()
+        .take(chunks[0].height as usize)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| {
+            if line.starts_with("Password:") {
+                Line::from(vec![
+                    Span::styled("Password: ", Style::default().fg(Color::White)),
+                    Span::styled(
+                        line.trim_start_matches("Password: ").to_string(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            } else {
+                Line::from(line.clone())
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(visible), chunks[0]);
+    let hint = if job.done {
+        " Enter/Esc/q: cerrar"
+    } else {
+        " ejecutando... la TUI sigue viva; espera a que termine"
+    };
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
 }
 
 fn draw_logs_modal(frame: &mut Frame, logs: &LogsModal, area: Rect) {

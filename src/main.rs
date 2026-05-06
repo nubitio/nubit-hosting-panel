@@ -11,6 +11,7 @@ mod ssh;
 mod store;
 mod tui;
 mod update;
+mod wp;
 
 use std::path::PathBuf;
 
@@ -50,6 +51,8 @@ enum Command {
     Caddy(CaddyCommand),
     /// Gestionar servidores DB, bases, usuarios y grants
     Db(DbCommand),
+    /// Provisionar WordPress en Docker Compose
+    Wp(WpCommand),
     /// Exportar metadata del panel en JSON
     Export {
         #[arg(long, default_value = "hostingctl-export.json")]
@@ -252,6 +255,53 @@ enum CaddySubcommand {
 struct DbCommand {
     #[command(subcommand)]
     command: DbSubcommand,
+}
+
+#[derive(Args)]
+struct WpCommand {
+    #[command(subcommand)]
+    command: WpSubcommand,
+}
+
+#[derive(Subcommand)]
+enum WpSubcommand {
+    /// Crea o migra un sitio WordPress con DB, compose y app proxy
+    Provision {
+        client: String,
+        slug: String,
+        #[arg(long)]
+        domain: String,
+        #[arg(long = "db-server")]
+        db_server: String,
+        #[arg(long, default_value = "fresh")]
+        mode: String,
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        #[arg(long)]
+        dump: Option<PathBuf>,
+        #[arg(long)]
+        reuse_existing_files: bool,
+        #[arg(long)]
+        old_domain: Option<String>,
+        #[arg(long)]
+        sites_dir: Option<PathBuf>,
+        #[arg(long)]
+        network: Option<String>,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        cli_image: Option<String>,
+        #[arg(long, default_value = "%")]
+        db_user_host: String,
+        #[arg(long)]
+        wp_db_host: Option<String>,
+        #[arg(long = "no-apply-caddy", default_value_t = false)]
+        no_apply_caddy: bool,
+        #[arg(long = "no-reload-caddy", default_value_t = false)]
+        no_reload_caddy: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -950,6 +1000,65 @@ fn main() -> Result<()> {
                 println!("✓ timer desinstalado");
             }
         },
+        Command::Wp(cmd) => match cmd.command {
+            WpSubcommand::Provision {
+                client,
+                slug,
+                domain,
+                db_server,
+                mode,
+                bundle,
+                archive,
+                dump,
+                reuse_existing_files,
+                old_domain,
+                sites_dir,
+                network,
+                image,
+                cli_image,
+                db_user_host,
+                wp_db_host,
+                no_apply_caddy,
+                no_reload_caddy,
+            } => {
+                let apply_caddy = !no_apply_caddy;
+                let summary = wp::provision(
+                    &cfg,
+                    &store,
+                    wp::ProvisionOptions {
+                        client,
+                        slug,
+                        domain,
+                        db_server,
+                        mode: wp::ProvisionMode::parse(&mode)?,
+                        bundle,
+                        archive,
+                        dump,
+                        reuse_existing_files,
+                        old_domain,
+                        sites_dir: sites_dir.unwrap_or_else(|| cfg.wp_sites_dir.clone()),
+                        network: network.unwrap_or_else(|| cfg.wp_network.clone()),
+                        image: image.unwrap_or_else(|| cfg.wp_image.clone()),
+                        cli_image: cli_image.unwrap_or_else(|| cfg.wp_cli_image.clone()),
+                        db_user_host,
+                        wp_db_host,
+                        apply_caddy,
+                        reload_caddy: apply_caddy && !no_reload_caddy,
+                    },
+                )?;
+                println!("WordPress provisionado: {}", summary.site_dir.display());
+                println!("compose:   {}", summary.compose_file.display());
+                println!("html:      {}", summary.html_dir.display());
+                println!("container: {}", summary.container);
+                println!("upstream:  {}", summary.upstream);
+                println!("database:  {}", summary.database);
+                println!("db user:   {}", summary.username);
+                print_secret(&summary.password);
+                if !apply_caddy {
+                    println!("siguiente: hostingctl caddy apply --reload");
+                }
+            }
+        },
     }
 
     Ok(())
@@ -976,6 +1085,10 @@ fn resolve_password(password: Option<String>, generate: bool) -> Result<String> 
         (None, true) => Ok(Alphanumeric.sample_string(&mut rand::rng(), 32)),
         _ => bail!("debes pasar --password 'secret' o --generate"),
     }
+}
+
+fn generate_password() -> String {
+    Alphanumeric.sample_string(&mut rand::rng(), 32)
 }
 
 fn print_secret(password: &str) {
@@ -1080,5 +1193,88 @@ mod tests {
             app.get_subcommands()
                 .any(|cmd| cmd.get_name() == "alias-add")
         );
+
+        assert!(root.get_subcommands().any(|cmd| cmd.get_name() == "wp"));
+    }
+
+    #[test]
+    fn cli_parses_wp_fresh_provision() {
+        let cli = Cli::parse_from([
+            "hostingctl",
+            "wp",
+            "provision",
+            "client",
+            "web",
+            "--domain",
+            "example.com",
+            "--db-server",
+            "mariadb",
+        ]);
+
+        match cli.command {
+            Command::Wp(cmd) => match cmd.command {
+                WpSubcommand::Provision {
+                    client,
+                    slug,
+                    domain,
+                    db_server,
+                    mode,
+                    ..
+                } => {
+                    assert_eq!(client, "client");
+                    assert_eq!(slug, "web");
+                    assert_eq!(domain, "example.com");
+                    assert_eq!(db_server, "mariadb");
+                    assert_eq!(mode, "fresh");
+                }
+            },
+            _ => panic!("expected wp provision"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_wp_existing_bundle_retry_flags() {
+        let cli = Cli::parse_from([
+            "hostingctl",
+            "wp",
+            "provision",
+            "client",
+            "web",
+            "--domain",
+            "example.com",
+            "--db-server",
+            "mariadb",
+            "--mode",
+            "existing",
+            "--bundle",
+            "backup.tar.gz",
+            "--reuse-existing-files",
+            "--old-domain",
+            "old.example.com",
+            "--no-apply-caddy",
+        ]);
+
+        match cli.command {
+            Command::Wp(cmd) => match cmd.command {
+                WpSubcommand::Provision {
+                    mode,
+                    bundle,
+                    reuse_existing_files,
+                    old_domain,
+                    no_apply_caddy,
+                    ..
+                } => {
+                    assert_eq!(mode, "existing");
+                    assert_eq!(
+                        bundle.as_deref(),
+                        Some(std::path::Path::new("backup.tar.gz"))
+                    );
+                    assert!(reuse_existing_files);
+                    assert_eq!(old_domain.as_deref(), Some("old.example.com"));
+                    assert!(no_apply_caddy);
+                }
+            },
+            _ => panic!("expected wp provision"),
+        }
     }
 }

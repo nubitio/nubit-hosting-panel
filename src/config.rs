@@ -14,6 +14,14 @@ pub struct Config {
     pub mssql_sqlcmd_path: String,
     #[serde(default = "default_backup_dir")]
     pub backup_dir: PathBuf,
+    #[serde(default = "default_wp_sites_dir")]
+    pub wp_sites_dir: PathBuf,
+    #[serde(default = "default_wp_network")]
+    pub wp_network: String,
+    #[serde(default = "default_wp_image")]
+    pub wp_image: String,
+    #[serde(default = "default_wp_cli_image")]
+    pub wp_cli_image: String,
     #[serde(default)]
     pub db_servers: HashMap<String, DbServerSecret>,
 }
@@ -64,6 +72,10 @@ impl Config {
             ),
             mssql_sqlcmd_path: "/opt/mssql-tools18/bin/sqlcmd".to_string(),
             backup_dir: PathBuf::from("./backups"),
+            wp_sites_dir: PathBuf::from("/opt/hosting/sites"),
+            wp_network: default_wp_network(),
+            wp_image: default_wp_image(),
+            wp_cli_image: default_wp_cli_image(),
             db_servers: HashMap::new(),
         })
     }
@@ -95,6 +107,22 @@ fn default_sqlcmd_path() -> String {
 
 fn default_backup_dir() -> PathBuf {
     PathBuf::from("./backups")
+}
+
+fn default_wp_sites_dir() -> PathBuf {
+    PathBuf::from("/opt/hosting/sites")
+}
+
+fn default_wp_network() -> String {
+    "hosting".to_string()
+}
+
+fn default_wp_image() -> String {
+    "wordpress:php8.5-apache".to_string()
+}
+
+fn default_wp_cli_image() -> String {
+    "wordpress:cli-php8.5".to_string()
 }
 
 fn env_key(value: &str) -> String {
