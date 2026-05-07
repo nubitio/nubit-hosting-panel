@@ -1,5 +1,6 @@
 use std::{
     fs::{self, File},
+    io::{BufRead, BufReader, BufWriter},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -18,6 +19,17 @@ use crate::{
 struct DbCreds {
     username: String,
     password: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlDumpInspection {
+    file_bytes: u64,
+    decoded_bytes: u64,
+    lines: u64,
+    create_table_statements: u64,
+    create_database_statements: u64,
+    use_statements: u64,
+    insert_statements: u64,
 }
 
 // ── Public dispatch ───────────────────────────────────────────────────────────
@@ -125,6 +137,35 @@ fn mariadb_restore(
     validate_restore_input(dump_path)?;
     ensure_identifier(database)?;
     let creds = mariadb_creds(cfg, server)?;
+    let inspection = inspect_sql_dump(dump_path)?;
+
+    println!(
+        "[db-import] iniciando restore MariaDB: server={} database={} dump={}",
+        server.name,
+        database,
+        dump_path.display()
+    );
+    println!(
+        "[db-import] dump: file_bytes={} decoded_bytes={} lines={} create_table={} create_database={} use={} insert={}",
+        inspection.file_bytes,
+        inspection.decoded_bytes,
+        inspection.lines,
+        inspection.create_table_statements,
+        inspection.create_database_statements,
+        inspection.use_statements,
+        inspection.insert_statements
+    );
+    if inspection.create_table_statements == 0 {
+        println!(
+            "[db-import] WARN: el dump no contiene sentencias CREATE TABLE detectables; la DB puede quedar sin tablas"
+        );
+    }
+    if inspection.use_statements > 0 || inspection.create_database_statements > 0 {
+        println!(
+            "[db-import] WARN: el dump contiene CREATE DATABASE/USE; si apunta a otra DB puede importar fuera de `{}` o fallar según permisos",
+            database
+        );
+    }
 
     let mut cmd = docker_exec_base(server, creds.password.as_deref(), "MYSQL_PWD");
     cmd.arg("mariadb")
@@ -135,25 +176,43 @@ fn mariadb_restore(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    println!(
+        "[db-import] comando: docker exec{} {} mariadb -u {} {} < {}",
+        if creds.password.is_some() {
+            " -e MYSQL_PWD=<redacted>"
+        } else {
+            ""
+        },
+        server.name,
+        creds.username,
+        database,
+        dump_path.display()
+    );
+
     let mut child = cmd.spawn().wrap_err("ejecutando mariadb vía docker exec")?;
+    let mut copied_bytes = 0_u64;
     {
         let stdin = child
             .stdin
             .take()
             .ok_or_else(|| eyre!("no se pudo abrir stdin de mariadb"))?;
-        let mut writer = std::io::BufWriter::new(stdin);
+        let mut writer = BufWriter::new(stdin);
 
         // El argumento posicional `database` ya selecciona la DB por defecto.
         // No inyectamos USE para evitar conflictos con el sandbox mode de
         // MariaDB 11.8 que procesa las primeras líneas de forma especial.
         let mut input = open_dump(dump_path)?;
         match std::io::copy(&mut input, &mut writer) {
-            Ok(_) => {}
+            Ok(bytes) => copied_bytes = bytes,
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
             Err(e) => return Err(e).wrap_err("escribiendo dump a stdin de mariadb"),
         }
     }
+    println!("[db-import] bytes enviados a mariadb stdin: {copied_bytes}");
     let output = child.wait_with_output()?;
+    println!("[db-import] mariadb exit_status: {}", output.status);
+    log_command_output("stdout", &output.stdout);
+    log_command_output("stderr", &output.stderr);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -174,6 +233,20 @@ fn mariadb_restore(
             dump_path.display(),
             detail
         );
+    }
+    let tables = mariadb_table_names(server, creds.password.as_deref(), &creds.username, database)
+        .wrap_err("verificando tablas después del restore")?;
+    println!(
+        "[db-import] verificación post-restore: tables_count={}",
+        tables.len()
+    );
+    if tables.is_empty() {
+        println!(
+            "[db-import] WARN: restore terminó con exit 0 pero `{}` no tiene tablas",
+            database
+        );
+    } else {
+        println!("[db-import] tablas detectadas: {}", tables.join(", "));
     }
     Ok(())
 }
@@ -379,6 +452,106 @@ fn open_dump(dump_path: &Path) -> Result<Box<dyn std::io::Read>> {
     } else {
         Ok(Box::new(File::open(dump_path)?))
     }
+}
+
+fn inspect_sql_dump(dump_path: &Path) -> Result<SqlDumpInspection> {
+    let file_bytes = fs::metadata(dump_path)
+        .wrap_err_with(|| format!("leyendo metadata de {}", dump_path.display()))?
+        .len();
+    let mut reader = BufReader::new(open_dump(dump_path)?);
+    let mut inspection = SqlDumpInspection {
+        file_bytes,
+        decoded_bytes: 0,
+        lines: 0,
+        create_table_statements: 0,
+        create_database_statements: 0,
+        use_statements: 0,
+        insert_statements: 0,
+    };
+
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .wrap_err_with(|| format!("leyendo dump {}", dump_path.display()))?;
+        if read == 0 {
+            break;
+        }
+        inspection.lines += 1;
+        inspection.decoded_bytes += read as u64;
+        count_sql_statement(&mut inspection, &String::from_utf8_lossy(&line));
+    }
+
+    Ok(inspection)
+}
+
+fn count_sql_statement(inspection: &mut SqlDumpInspection, line: &str) {
+    let normalized = line.trim_start().to_ascii_lowercase();
+    if normalized.starts_with("create table") || normalized.starts_with("create temporary table") {
+        inspection.create_table_statements += 1;
+    } else if normalized.starts_with("create database") {
+        inspection.create_database_statements += 1;
+    } else if normalized.starts_with("use ") {
+        inspection.use_statements += 1;
+    } else if normalized.starts_with("insert into") {
+        inspection.insert_statements += 1;
+    }
+}
+
+fn log_command_output(stream: &str, bytes: &[u8]) {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        println!("[db-import] mariadb {stream}: <empty>");
+    } else {
+        println!("[db-import] mariadb {stream}:\n{text}");
+    }
+}
+
+fn mariadb_table_names(
+    server: &DbServer,
+    password: Option<&str>,
+    username: &str,
+    database: &str,
+) -> Result<Vec<String>> {
+    let mut cmd = docker_exec_base(server, password, "MYSQL_PWD");
+    cmd.arg("mariadb")
+        .arg("-N")
+        .arg("-B")
+        .arg("-u")
+        .arg(username)
+        .arg(database)
+        .arg("-e")
+        .arg("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().wrap_err("ejecutando SHOW FULL TABLES")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "SHOW FULL TABLES falló para `{}`: {}{}{}",
+            database,
+            stderr.trim(),
+            if stderr.trim().is_empty() || stdout.trim().is_empty() {
+                ""
+            } else {
+                "\n"
+            },
+            stdout.trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter_map(|line| line.split('\t').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 fn collect_dumps(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
