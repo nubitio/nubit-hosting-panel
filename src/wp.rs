@@ -103,6 +103,8 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
         backup_migrated_wp_config(&html_dir)?;
     }
 
+    normalize_wp_permissions(&html_dir)?;
+
     let dump_path = opts
         .dump
         .as_deref()
@@ -558,6 +560,46 @@ fn looks_like_wp_root(dir: &Path) -> bool {
         || dir.join("index.php").is_file()
 }
 
+fn normalize_wp_permissions(html_dir: &Path) -> Result<()> {
+    if !html_dir.exists() {
+        return Ok(());
+    }
+
+    normalize_path_permissions(html_dir)?;
+    collect_paths(html_dir, &mut |path| normalize_path_permissions(path))?;
+    Ok(())
+}
+
+fn normalize_path_permissions(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("leyendo permisos de {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    let mode = if metadata.is_dir() { 0o755 } else { 0o644 };
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions)
+        .wrap_err_with(|| format!("ajustando permisos de {}", path.display()))?;
+    Ok(())
+}
+
+fn collect_paths<F>(root: &Path, visit: &mut F) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    for entry in fs::read_dir(root).wrap_err_with(|| format!("leyendo {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        visit(&path)?;
+        if path.is_dir() {
+            collect_paths(&path, visit)?;
+        }
+    }
+    Ok(())
+}
+
 fn backup_migrated_wp_config(html_dir: &Path) -> Result<()> {
     let config = html_dir.join("wp-config.php");
     if !config.exists() {
@@ -800,6 +842,49 @@ mod tests {
 
         assert!(!html.join("wp-config.php").exists());
         assert!(html.join("wp-config.php.migrated.bak").is_file());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn normalize_wp_permissions_makes_htaccess_readable_by_apache() {
+        let tmp = tempfile_dir("wp-permissions");
+        let html = tmp.join("html");
+        let uploads = html.join("wp-content").join("uploads");
+        fs::create_dir_all(&uploads).unwrap();
+        fs::write(html.join(".htaccess"), "# wordpress").unwrap();
+        fs::write(uploads.join("image.jpg"), "img").unwrap();
+
+        fs::set_permissions(&html, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(html.join(".htaccess"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&uploads, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(uploads.join("image.jpg"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        normalize_wp_permissions(&html).unwrap();
+
+        assert_eq!(
+            fs::metadata(&html).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(html.join(".htaccess"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(&uploads).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(uploads.join("image.jpg"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
         let _ = fs::remove_dir_all(tmp);
     }
 
