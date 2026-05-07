@@ -132,7 +132,8 @@ fn mariadb_restore(
         .arg("-u")
         .arg(&creds.username)
         .arg(database)
-        .stdin(Stdio::piped());
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().wrap_err("ejecutando mariadb vía docker exec")?;
     {
@@ -142,15 +143,32 @@ fn mariadb_restore(
             .ok_or_else(|| eyre!("no se pudo abrir stdin de mariadb"))?;
         let mut writer = std::io::BufWriter::new(stdin);
         let mut reader = std::io::BufReader::new(input);
-        std::io::copy(&mut reader, &mut writer)?;
+        match std::io::copy(&mut reader, &mut writer) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                // mariadb cerró stdin antes de leer todo — el exit code dirá si falló
+            }
+            Err(e) => return Err(e).wrap_err("escribiendo dump a stdin de mariadb"),
+        }
     }
-    let status = child.wait()?;
-    if !status.success() {
-        bail!(
-            "restore falló para `{}` desde {}",
-            database,
-            dump_path.display()
-        );
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!(
+                "restore falló para `{}` desde {} (sin stderr)",
+                database,
+                dump_path.display()
+            );
+        } else {
+            bail!(
+                "restore falló para `{}` desde {}:\n{}",
+                database,
+                dump_path.display(),
+                stderr
+            );
+        }
     }
     Ok(())
 }
