@@ -11,11 +11,22 @@ pub fn render_block(apps: &[App], aliases: &[DomainAlias]) -> String {
     let mut out = String::new();
     out.push_str("# This file is managed by hostingctl. Do not edit manually.\n\n");
     for app in apps {
-        let extra: Vec<&str> = aliases
+        let (redirect_aliases, proxy_aliases): (Vec<&DomainAlias>, Vec<&DomainAlias>) = aliases
             .iter()
             .filter(|a| a.app_id == app.id)
-            .map(|a| a.domain.as_str())
-            .collect();
+            .partition(|a| is_www_alias_for(&a.domain, &app.domain));
+
+        for alias in redirect_aliases {
+            out.push_str(&format!(
+                "# client: {client} app: {slug} canonical redirect\n{alias} {{\n  redir https://{canonical}{{uri}} permanent\n}}\n\n",
+                client = app.client_slug,
+                slug = app.slug,
+                alias = alias.domain,
+                canonical = app.domain,
+            ));
+        }
+
+        let extra: Vec<&str> = proxy_aliases.iter().map(|a| a.domain.as_str()).collect();
         let domains = if extra.is_empty() {
             app.domain.clone()
         } else {
@@ -30,6 +41,13 @@ pub fn render_block(apps: &[App], aliases: &[DomainAlias]) -> String {
         ));
     }
     out
+}
+
+fn is_www_alias_for(alias: &str, canonical: &str) -> bool {
+    alias
+        .strip_prefix("www.")
+        .map(|without_www| without_www.eq_ignore_ascii_case(canonical))
+        .unwrap_or(false)
 }
 
 fn render_proxy(upstream: &str) -> String {
@@ -138,7 +156,7 @@ fn import_target(cfg: &Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::App;
+    use crate::store::{App, DomainAlias};
     use chrono::Utc;
 
     #[test]
@@ -197,5 +215,36 @@ mod tests {
 
         assert!(rendered.contains("reverse_proxy http://10.0.0.50:8080"));
         assert!(!rendered.contains("header_up Host"));
+    }
+
+    #[test]
+    fn render_block_redirects_www_alias_to_canonical_domain() {
+        let app = App {
+            id: "app-1".into(),
+            client_slug: "dimexa".into(),
+            slug: "web".into(),
+            domain: "dimexa.com.pe".into(),
+            upstream: "dimexa_wordpress:80".into(),
+            notes: None,
+            created_at: Utc::now(),
+        };
+        let rendered = render_block(
+            std::slice::from_ref(&app),
+            &[DomainAlias {
+                id: "alias-1".into(),
+                app_id: app.id.clone(),
+                domain: "www.dimexa.com.pe".into(),
+                created_at: Utc::now(),
+            }],
+        );
+
+        assert!(
+            rendered.contains("www.dimexa.com.pe {\n  redir https://dimexa.com.pe{uri} permanent")
+        );
+        assert!(
+            rendered.contains(
+                "dimexa.com.pe {\n  encode zstd gzip\n  reverse_proxy dimexa_wordpress:80"
+            )
+        );
     }
 }

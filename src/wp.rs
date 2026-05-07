@@ -12,7 +12,7 @@ use crate::{
     backup, caddy,
     config::Config,
     db, docker,
-    store::{DbServer, ProvisionedDb, Store, convention_names, validate_slug},
+    store::{App, DbServer, ProvisionedDb, Store, convention_names, validate_slug},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +79,7 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
     let imports_dir = site_dir.join("imports");
     let compose_file = site_dir.join("compose.yml");
     let env_file = site_dir.join(".env");
+    let canonical_domain = canonical_domain(&opts.domain);
     let wp_db_host = opts
         .wp_db_host
         .clone()
@@ -135,7 +136,14 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
             .wrap_err_with(|| format!("importando dump {}", dump.display()))?;
     }
 
-    ensure_app_registered(store, &opts.client, &opts.slug, &opts.domain, &upstream)?;
+    let app = ensure_app_registered(
+        store,
+        &opts.client,
+        &opts.slug,
+        &canonical_domain,
+        &upstream,
+    )?;
+    ensure_www_redirect_alias(store, &app, &canonical_domain)?;
     link_grant_to_app(
         store,
         &server.name,
@@ -147,7 +155,7 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
     )?;
 
     if let Some(old_domain) = &opts.old_domain {
-        run_search_replace(&site_dir, &opts, old_domain, &opts.domain)?;
+        run_search_replace(&site_dir, &opts, old_domain, &canonical_domain)?;
     }
 
     if opts.apply_caddy {
@@ -569,20 +577,58 @@ fn backup_migrated_wp_config(html_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn canonical_domain(domain: &str) -> String {
+    let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    normalized
+        .strip_prefix("www.")
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+fn www_domain_for(canonical_domain: &str) -> Option<String> {
+    if canonical_domain.is_empty()
+        || canonical_domain.starts_with("www.")
+        || !canonical_domain.contains('.')
+    {
+        None
+    } else {
+        Some(format!("www.{canonical_domain}"))
+    }
+}
+
+fn ensure_www_redirect_alias(store: &Store, app: &App, canonical_domain: &str) -> Result<()> {
+    let Some(www_domain) = www_domain_for(canonical_domain) else {
+        return Ok(());
+    };
+
+    if store
+        .list_domain_aliases()?
+        .into_iter()
+        .any(|alias| alias.app_id == app.id && alias.domain.eq_ignore_ascii_case(&www_domain))
+    {
+        return Ok(());
+    }
+
+    store
+        .add_domain_alias(&app.id, &www_domain)
+        .wrap_err_with(|| format!("registrando alias canonical www: {www_domain}"))?;
+    Ok(())
+}
+
 fn ensure_app_registered(
     store: &Store,
     client: &str,
     slug: &str,
     domain: &str,
     upstream: &str,
-) -> Result<()> {
+) -> Result<App> {
     if let Some(existing) = store
         .list_apps()?
         .into_iter()
         .find(|app| app.client_slug == client && app.slug == slug)
     {
         if existing.domain == domain && existing.upstream == upstream {
-            return Ok(());
+            return Ok(existing);
         }
         bail!(
             "app {}/{} ya existe con domain/upstream distinto: {} -> {}",
@@ -592,8 +638,7 @@ fn ensure_app_registered(
             existing.upstream
         );
     }
-    store.add_app(client, slug, domain, upstream)?;
-    Ok(())
+    store.add_app(client, slug, domain, upstream)
 }
 
 fn link_grant_to_app(
@@ -780,6 +825,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(store.list_apps().unwrap().len(), 1);
+        let _ = fs::remove_file(db);
+    }
+
+    #[test]
+    fn canonical_domain_strips_www_and_normalizes_case() {
+        assert_eq!(canonical_domain("WWW.Dimexa.COM.PE."), "dimexa.com.pe");
+        assert_eq!(canonical_domain("dimexa.com.pe"), "dimexa.com.pe");
+    }
+
+    #[test]
+    fn ensure_www_redirect_alias_adds_www_alias_once() {
+        let db = std::env::temp_dir().join(format!(
+            "hostingctl-wp-www-alias-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&db).unwrap();
+        store.add_client("client", "Client", None).unwrap();
+        let app = store
+            .add_app("client", "web", "example.com", "client_web_wordpress:80")
+            .unwrap();
+
+        ensure_www_redirect_alias(&store, &app, "example.com").unwrap();
+        ensure_www_redirect_alias(&store, &app, "example.com").unwrap();
+
+        let aliases = store.list_domain_aliases().unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].domain, "www.example.com");
         let _ = fs::remove_file(db);
     }
 
