@@ -12,7 +12,7 @@ use crate::{
     backup, caddy,
     config::Config,
     db, docker,
-    store::{Store, validate_slug},
+    store::{DbServer, ProvisionedDb, Store, convention_names, validate_slug},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,28 +107,15 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
         .as_deref()
         .or_else(|| bundle.as_ref().and_then(|bundle| bundle.dump.as_deref()));
 
-    let password = crate::generate_password();
-    let provisioned = db::provision(
+    let provisioned = provision_database_without_app_link(
         cfg,
         store,
         &server,
         &opts.client,
         &opts.slug,
-        "prod",
         &opts.db_user_host,
-        None,
-        None,
-        password,
     )
     .wrap_err("provisionando database WordPress")?;
-    db::reset_password(
-        cfg,
-        &server,
-        &provisioned.username,
-        &provisioned.host,
-        &provisioned.password,
-    )
-    .wrap_err("sincronizando password database WordPress")?;
 
     write_env_file(
         &env_file,
@@ -149,6 +136,15 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
     docker::compose_up(&site_dir)?;
 
     ensure_app_registered(store, &opts.client, &opts.slug, &opts.domain, &upstream)?;
+    link_grant_to_app(
+        store,
+        &server.name,
+        &provisioned.database,
+        &provisioned.username,
+        &provisioned.host,
+        &opts.client,
+        &opts.slug,
+    )?;
 
     if let Some(old_domain) = &opts.old_domain {
         run_search_replace(&site_dir, &opts, old_domain, &opts.domain)?;
@@ -172,6 +168,40 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
         database: provisioned.database,
         username: provisioned.username,
         password: provisioned.password,
+    })
+}
+
+fn provision_database_without_app_link(
+    cfg: &Config,
+    store: &Store,
+    server: &DbServer,
+    client: &str,
+    app: &str,
+    host: &str,
+) -> Result<ProvisionedDb> {
+    if server.kind != "mariadb" && server.kind != "mysql" {
+        bail!(
+            "WordPress requiere DB mariadb/mysql; server `{}` es `{}`",
+            server.name,
+            server.kind
+        );
+    }
+    let (database, username) = convention_names(client, app, "prod")?;
+    let password = crate::generate_password();
+
+    db::create_database(cfg, server, &database)?;
+    db::create_user(cfg, server, &username, host, &password)?;
+    db::grant_all(
+        cfg, store, server, client, None, "prod", &database, &username, host,
+    )?;
+    db::reset_password(cfg, server, &username, host, &password)
+        .wrap_err("sincronizando password database WordPress")?;
+
+    Ok(ProvisionedDb {
+        database,
+        username,
+        host: host.to_string(),
+        password,
     })
 }
 
@@ -563,6 +593,37 @@ fn ensure_app_registered(
         );
     }
     store.add_app(client, slug, domain, upstream)?;
+    Ok(())
+}
+
+fn link_grant_to_app(
+    store: &Store,
+    server: &str,
+    database: &str,
+    username: &str,
+    host: &str,
+    client: &str,
+    app: &str,
+) -> Result<()> {
+    let grant = store
+        .list_database_grants()?
+        .into_iter()
+        .find(|grant| {
+            grant.server_name == server
+                && grant.db_name == database
+                && grant.username == username
+                && grant.host == host
+        })
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "grant no encontrado tras provisionar DB: server={} db={} user={} host={}",
+                server,
+                database,
+                username,
+                host
+            )
+        })?;
+    store.reassign_database_grant(&grant.id, client, Some(app), Some("prod"))?;
     Ok(())
 }
 
