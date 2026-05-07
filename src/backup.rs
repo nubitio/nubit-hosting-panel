@@ -129,6 +129,7 @@ fn mariadb_restore(
 
     let mut cmd = docker_exec_base(server, creds.password.as_deref(), "MYSQL_PWD");
     cmd.arg("mariadb")
+        .arg("--one-database") // ignora USE statements del dump; fuerza todo a la DB target
         .arg("-u")
         .arg(&creds.username)
         .arg(database)
