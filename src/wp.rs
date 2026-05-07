@@ -127,10 +127,8 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
     write_compose_file(&compose_file, &opts, &container)?;
 
     if let Some(dump) = dump_path {
-        eprintln!("[hostingctl] importando dump: {}", dump.display());
         backup::restore(cfg, &server, &provisioned.database, dump)
             .wrap_err_with(|| format!("importando dump {}", dump.display()))?;
-        eprintln!("[hostingctl] dump importado OK");
     }
 
     docker::ensure_network(&opts.network)?;

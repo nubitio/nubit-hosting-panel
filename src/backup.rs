@@ -177,21 +177,21 @@ fn mariadb_restore(
         }
     }
     let output = child.wait_with_output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stdout.trim().is_empty() {
-        eprintln!("[mariadb restore stdout] {}", stdout.trim());
-    }
-    if !stderr.trim().is_empty() {
-        eprintln!("[mariadb restore stderr] {}", stderr.trim());
-    }
     if !output.status.success() {
-        let msg = if stderr.trim().is_empty() { "sin stderr" } else { stderr.trim() };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = [stderr.trim(), stdout.trim()]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = if detail.is_empty() { "sin output" } else { &detail };
         bail!(
             "restore falló para `{}` desde {}:\n{}",
             database,
             dump_path.display(),
-            msg
+            detail
         );
     }
     Ok(())
