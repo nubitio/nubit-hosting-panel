@@ -1,5 +1,6 @@
 use std::{
     fs::{self, File},
+    io::{BufRead, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -143,13 +144,16 @@ fn mariadb_restore(
             .take()
             .ok_or_else(|| eyre!("no se pudo abrir stdin de mariadb"))?;
         let mut writer = std::io::BufWriter::new(stdin);
-        let mut reader = std::io::BufReader::new(input);
-        match std::io::copy(&mut reader, &mut writer) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                // mariadb cerró stdin antes de leer todo — el exit code dirá si falló
+        // Filtramos la directiva de sandbox mode de MariaDB 11.8+ que bloquea
+        // imports en clientes de versiones anteriores.
+        let reader = std::io::BufReader::new(input);
+        for line in reader.lines() {
+            let line = line.wrap_err("leyendo dump")?;
+            if line.contains("enable the sandbox mode") {
+                continue;
             }
-            Err(e) => return Err(e).wrap_err("escribiendo dump a stdin de mariadb"),
+            writer.write_all(line.as_bytes()).ok(); // BrokenPipe → ignorar, exit code manda
+            writer.write_all(b"\n").ok();
         }
     }
     let output = child.wait_with_output()?;
