@@ -167,7 +167,7 @@ fn mariadb_restore(
         );
     }
 
-    let mut cmd = docker_exec_base(server, creds.password.as_deref(), "MYSQL_PWD");
+    let mut cmd = docker_exec_interactive_base(server, creds.password.as_deref(), "MYSQL_PWD");
     cmd.arg("mariadb")
         .arg("-u")
         .arg(&creds.username)
@@ -177,7 +177,7 @@ fn mariadb_restore(
         .stderr(Stdio::piped());
 
     println!(
-        "[db-import] comando: docker exec{} {} mariadb -u {} {} < {}",
+        "[db-import] comando: docker exec -i{} {} mariadb -u {} {} < {}",
         if creds.password.is_some() {
             " -e MYSQL_PWD=<redacted>"
         } else {
@@ -577,6 +577,20 @@ fn collect_dumps(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
 fn docker_exec_base(server: &DbServer, password: Option<&str>, env_var: &str) -> Command {
     let mut cmd = Command::new("docker");
     cmd.arg("exec");
+    if let Some(pw) = password {
+        cmd.arg("-e").arg(format!("{env_var}={pw}"));
+    }
+    cmd.arg(&server.name);
+    cmd
+}
+
+fn docker_exec_interactive_base(
+    server: &DbServer,
+    password: Option<&str>,
+    env_var: &str,
+) -> Command {
+    let mut cmd = Command::new("docker");
+    cmd.arg("exec").arg("-i");
     if let Some(pw) = password {
         cmd.arg("-e").arg(format!("{env_var}={pw}"));
     }
