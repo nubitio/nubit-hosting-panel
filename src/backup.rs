@@ -130,7 +130,6 @@ fn mariadb_restore(
 
     let mut cmd = docker_exec_base(server, creds.password.as_deref(), "MYSQL_PWD");
     cmd.arg("mariadb")
-        .arg("--one-database") // ignora USE statements del dump; fuerza todo a la DB target
         .arg("-u")
         .arg(&creds.username)
         .arg(database)
@@ -144,16 +143,36 @@ fn mariadb_restore(
             .take()
             .ok_or_else(|| eyre!("no se pudo abrir stdin de mariadb"))?;
         let mut writer = std::io::BufWriter::new(stdin);
-        // Filtramos la directiva de sandbox mode de MariaDB 11.8+ que bloquea
-        // imports en clientes de versiones anteriores.
+
+        // Forzamos la DB target al inicio para que cualquier USE del dump no
+        // desvíe las tablas a otra base de datos.
+        let use_stmt = format!("USE `{}`;\n", database);
+        writer
+            .write_all(use_stmt.as_bytes())
+            .wrap_err("escribiendo USE statement")?;
+
+        // Filtramos la directiva sandbox mode de MariaDB 11.8+ (bloquea imports
+        // en clientes de versiones anteriores) y cualquier USE/CREATE DATABASE
+        // que pudiera redirigir las tablas.
         let reader = std::io::BufReader::new(input);
         for line in reader.lines() {
             let line = line.wrap_err("leyendo dump")?;
-            if line.contains("enable the sandbox mode") {
+            let trimmed = line.trim_start();
+            if trimmed.contains("enable the sandbox mode")
+                || trimmed.to_ascii_uppercase().starts_with("USE ")
+                || trimmed.to_ascii_uppercase().starts_with("CREATE DATABASE")
+                || trimmed.to_ascii_uppercase().starts_with("DROP DATABASE")
+            {
                 continue;
             }
-            writer.write_all(line.as_bytes()).ok(); // BrokenPipe → ignorar, exit code manda
-            writer.write_all(b"\n").ok();
+            match writer
+                .write_all(line.as_bytes())
+                .and_then(|_| writer.write_all(b"\n"))
+            {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(e) => return Err(e).wrap_err("escribiendo dump a stdin de mariadb"),
+            }
         }
     }
     let output = child.wait_with_output()?;
