@@ -893,13 +893,6 @@ fn scan_file(html_dir: &Path, path: &Path, findings: &mut Vec<ScanFinding>) -> R
         .unwrap_or_default()
         .to_ascii_lowercase();
     let in_uploads = rel.starts_with(Path::new("wp-content/uploads"));
-    if in_uploads && ext == "php" {
-        findings.push(ScanFinding {
-            status: CheckStatus::Fail,
-            path: rel.clone(),
-            detail: "archivo PHP dentro de uploads".to_string(),
-        });
-    }
 
     let should_scan_text = matches!(
         ext.as_str(),
@@ -912,24 +905,67 @@ fn scan_file(html_dir: &Path, path: &Path, findings: &mut Vec<ScanFinding>) -> R
     }
     let bytes = fs::read(path).wrap_err_with(|| format!("leyendo {}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-    let patterns = [
+
+    if in_uploads && ext == "php" && !is_benign_index_php(&rel, &text) {
+        findings.push(ScanFinding {
+            status: CheckStatus::Fail,
+            path: rel.clone(),
+            detail: "archivo PHP ejecutable dentro de uploads".to_string(),
+        });
+    }
+
+    if is_media_extension(&ext) && text.contains("<?php") {
+        findings.push(ScanFinding {
+            status: CheckStatus::Fail,
+            path: rel.clone(),
+            detail: "archivo media contiene código PHP embebido".to_string(),
+        });
+    }
+
+    let critical_patterns = [
+        ("eval(base64_decode(", "eval(base64_decode())"),
+        ("eval(gzinflate(", "eval(gzinflate())"),
+        ("assert($_", "assert() con input de usuario"),
+        ("eval($_", "eval() con input de usuario"),
+        ("system($_", "system() con input de usuario"),
+        ("shell_exec($_", "shell_exec() con input de usuario"),
+        ("passthru($_", "passthru() con input de usuario"),
+        ("preg_replace('/.*/e", "preg_replace /e"),
+        ("filesman", "firma FilesMan"),
+        ("c99shell", "firma c99shell"),
+        ("r57shell", "firma r57shell"),
+    ];
+    let critical: Vec<_> = critical_patterns
+        .iter()
+        .filter(|(needle, _)| text.contains(*needle))
+        .map(|(_, label)| *label)
+        .collect();
+    if !critical.is_empty() {
+        findings.push(ScanFinding {
+            status: CheckStatus::Fail,
+            path: rel.clone(),
+            detail: format!("indicadores críticos: {}", critical.join(", ")),
+        });
+    }
+
+    if ext != "php" && ext != "phtml" {
+        return Ok(());
+    }
+
+    let generic_patterns = [
         "eval(",
         "base64_decode(",
         "gzinflate(",
         "shell_exec(",
         "passthru(",
         "assert(",
-        "preg_replace('/.*/e",
-        "filesman",
-        "c99shell",
-        "r57shell",
     ];
-    let matched: Vec<_> = patterns
+    let matched: Vec<_> = generic_patterns
         .iter()
         .filter(|p| text.contains(**p))
         .copied()
         .collect();
-    if !matched.is_empty() {
+    if !matched.is_empty() && !is_noise_prone_vendor_path(&rel) {
         findings.push(ScanFinding {
             status: CheckStatus::Warn,
             path: rel,
@@ -937,6 +973,44 @@ fn scan_file(html_dir: &Path, path: &Path, findings: &mut Vec<ScanFinding>) -> R
         });
     }
     Ok(())
+}
+
+fn is_media_extension(ext: &str) -> bool {
+    matches!(ext, "ico" | "jpg" | "jpeg" | "png" | "gif")
+}
+
+fn is_benign_index_php(rel: &Path, text: &str) -> bool {
+    rel.file_name()
+        .and_then(|s| s.to_str())
+        .map(|name| name.eq_ignore_ascii_case("index.php"))
+        .unwrap_or(false)
+        && !text.contains("$_")
+        && !text.contains("eval(")
+        && !text.contains("base64_decode(")
+        && !text.contains("gzinflate(")
+        && !text.contains("shell_exec(")
+        && !text.contains("passthru(")
+        && text.trim().len() <= 256
+}
+
+fn is_noise_prone_vendor_path(rel: &Path) -> bool {
+    rel.starts_with(Path::new("wp-includes"))
+        || rel.starts_with(Path::new("wp-admin"))
+        || path_has_component(rel, "vendor")
+        || path_has_component(rel, "vendor_prefixed")
+        || path_has_component(rel, "node_modules")
+        || path_has_component(rel, "dist")
+        || path_has_component(rel, "build")
+}
+
+fn path_has_component(path: &Path, needle: &str) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .map(|part| part.eq_ignore_ascii_case(needle))
+            .unwrap_or(false)
+    })
 }
 
 fn backup_migrated_wp_config(html_dir: &Path) -> Result<()> {
@@ -1296,6 +1370,60 @@ mod tests {
                 .any(|finding| finding.status == CheckStatus::Warn
                     && finding.detail.contains("base64_decode"))
         );
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn scan_site_ignores_benign_uploads_index_php() {
+        let tmp = tempfile_dir("wp-scan-benign-index");
+        let html = tmp.join("client").join("web").join("html");
+        fs::create_dir_all(html.join("wp-content").join("uploads").join("smush")).unwrap();
+        fs::write(
+            html.join("wp-content")
+                .join("uploads")
+                .join("smush")
+                .join("index.php"),
+            "<?php\n// Silence is golden.\n",
+        )
+        .unwrap();
+
+        let findings = scan_site(&tmp, "client", "web").unwrap();
+
+        assert!(findings.is_empty());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn scan_site_suppresses_generic_wordpress_core_noise() {
+        let tmp = tempfile_dir("wp-scan-core-noise");
+        let html = tmp.join("client").join("web").join("html");
+        fs::create_dir_all(html.join("wp-includes")).unwrap();
+        fs::write(
+            html.join("wp-includes").join("class-json.php"),
+            "<?php function ok() { eval('$legacy'); }",
+        )
+        .unwrap();
+
+        let findings = scan_site(&tmp, "client", "web").unwrap();
+
+        assert!(findings.is_empty());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn scan_site_flags_php_embedded_in_media() {
+        let tmp = tempfile_dir("wp-scan-media-php");
+        let html = tmp.join("client").join("web").join("html");
+        fs::create_dir_all(html.join("wp-content").join("uploads")).unwrap();
+        fs::write(
+            html.join("wp-content").join("uploads").join("logo.png"),
+            "PNG bytes <?php eval($_POST['x']);",
+        )
+        .unwrap();
+
+        let findings = scan_site(&tmp, "client", "web").unwrap();
+
+        assert!(findings.iter().any(|finding| finding.status == CheckStatus::Fail));
         let _ = fs::remove_dir_all(tmp);
     }
 
