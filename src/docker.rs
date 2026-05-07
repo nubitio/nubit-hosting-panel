@@ -116,6 +116,7 @@ pub fn ensure_network(network: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn compose_stop(project_dir: &std::path::Path) -> Result<()> {
     let status = Command::new("docker")
         .arg("compose")

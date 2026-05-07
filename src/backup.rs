@@ -1,6 +1,5 @@
 use std::{
     fs::{self, File},
-    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -144,18 +143,9 @@ fn mariadb_restore(
             .ok_or_else(|| eyre!("no se pudo abrir stdin de mariadb"))?;
         let mut writer = std::io::BufWriter::new(stdin);
 
-        // Forzamos la DB target al inicio. El argumento posicional `database`
-        // de mariadb selecciona la DB por defecto, pero un USE en el dump la
-        // pisaría. Inyectamos nuestro propio USE primero y luego el dump raw.
-        let use_stmt = format!("USE `{}`;\n", database);
-        writer
-            .write_all(use_stmt.as_bytes())
-            .wrap_err("escribiendo USE statement")?;
-
-        // Copiamos el dump completo sin modificarlo. No filtramos líneas para
-        // evitar problemas con datos binarios o encodings no-UTF8.
-        // El sandbox mode de MariaDB 11.8 (/*M!999999\-...*/) es ignorado
-        // automáticamente por clientes que no lo entienden.
+        // El argumento posicional `database` ya selecciona la DB por defecto.
+        // No inyectamos USE para evitar conflictos con el sandbox mode de
+        // MariaDB 11.8 que procesa las primeras líneas de forma especial.
         let mut input = open_dump(dump_path)?;
         match std::io::copy(&mut input, &mut writer) {
             Ok(_) => {}
