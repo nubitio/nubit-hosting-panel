@@ -3,6 +3,7 @@ use std::{
     io::{BufRead, BufReader, BufWriter},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, SystemTime},
 };
 
 use chrono::Utc;
@@ -80,6 +81,55 @@ pub fn list_backups(
     collect_dumps(&root, &mut files)?;
     files.sort();
     Ok(files)
+}
+
+pub fn latest_backup(out_dir: &Path, server: &str, database: &str) -> Result<Option<PathBuf>> {
+    let mut files = list_backups(out_dir, Some(server), Some(database))?;
+    files.sort_by_key(|path| backup_modified(path).unwrap_or(SystemTime::UNIX_EPOCH));
+    Ok(files.pop())
+}
+
+pub fn prune_backups(
+    out_dir: &Path,
+    keep: Option<usize>,
+    retention_days: Option<u64>,
+) -> Result<Vec<PathBuf>> {
+    let files = list_backups(out_dir, None, None)?;
+    let mut groups = std::collections::BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+    for file in files {
+        let parent = file.parent().unwrap_or(out_dir).to_path_buf();
+        groups.entry(parent).or_default().push(file);
+    }
+
+    let cutoff = retention_days.and_then(|days| {
+        SystemTime::now().checked_sub(Duration::from_secs(days.saturating_mul(24 * 60 * 60)))
+    });
+    let keep = keep.unwrap_or(0);
+    let mut removed = Vec::new();
+
+    for (_, mut files) in groups {
+        files.sort_by_key(|path| backup_modified(path).unwrap_or(SystemTime::UNIX_EPOCH));
+        files.reverse();
+        for (idx, path) in files.into_iter().enumerate() {
+            if idx < keep {
+                continue;
+            }
+            let old_enough = cutoff
+                .map(|cutoff| {
+                    backup_modified(&path)
+                        .map(|mtime| mtime < cutoff)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            if old_enough {
+                fs::remove_file(&path)
+                    .wrap_err_with(|| format!("eliminando {}", path.display()))?;
+                removed.push(path);
+            }
+        }
+    }
+
+    Ok(removed)
 }
 
 // ── MariaDB backup / restore ──────────────────────────────────────────────────
@@ -574,6 +624,10 @@ fn collect_dumps(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+fn backup_modified(path: &Path) -> Result<SystemTime> {
+    Ok(fs::metadata(path)?.modified()?)
+}
+
 fn docker_exec_base(server: &DbServer, password: Option<&str>, env_var: &str) -> Command {
     let mut cmd = Command::new("docker");
     cmd.arg("exec");
@@ -634,6 +688,47 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["a.sql", "b.sql.gz", "c.bak"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn latest_backup_returns_newest_file() {
+        let root = std::env::temp_dir().join(format!("hostingctl-test-{}", uuid::Uuid::new_v4()));
+        let db_dir = root.join("mariadb").join("app_db");
+        fs::create_dir_all(&db_dir).unwrap();
+        fs::write(db_dir.join("20260101-010101.sql.gz"), "old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(db_dir.join("20260102-010101.sql.gz"), "new").unwrap();
+
+        let latest = latest_backup(&root, "mariadb", "app_db").unwrap().unwrap();
+        assert_eq!(latest.file_name().unwrap(), "20260102-010101.sql.gz");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prune_backups_respects_keep_count() {
+        let root = std::env::temp_dir().join(format!("hostingctl-test-{}", uuid::Uuid::new_v4()));
+        let db_dir = root.join("mariadb").join("app_db");
+        let other_dir = root.join("mariadb").join("other_db");
+        fs::create_dir_all(&db_dir).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(db_dir.join("a.sql.gz"), "a").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(db_dir.join("b.sql.gz"), "b").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(db_dir.join("c.sql.gz"), "c").unwrap();
+        fs::write(other_dir.join("a.sql.gz"), "a").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(other_dir.join("b.sql.gz"), "b").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(other_dir.join("c.sql.gz"), "c").unwrap();
+
+        let removed = prune_backups(&root, Some(2), None).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(db_dir.join("b.sql.gz").exists());
+        assert!(db_dir.join("c.sql.gz").exists());
+        assert!(other_dir.join("b.sql.gz").exists());
+        assert!(other_dir.join("c.sql.gz").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -13,7 +13,10 @@ mod tui;
 mod update;
 mod wp;
 
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+};
 
 use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre::{Result, bail};
@@ -182,6 +185,10 @@ enum AppSubcommand {
         slug: String,
         #[arg(long, default_value = "auto")]
         shell: String,
+    },
+    Health {
+        client: String,
+        slug: String,
     },
     List,
 }
@@ -436,6 +443,18 @@ enum DbSubcommand {
         #[arg(long)]
         dry_run: bool,
     },
+    RestoreLatest {
+        server: String,
+        database: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long = "no-pre-backup", default_value_t = false)]
+        no_pre_backup: bool,
+    },
     BackupList {
         #[arg(long, default_value = "./backups")]
         out: PathBuf,
@@ -447,6 +466,10 @@ enum DbSubcommand {
     BackupAll {
         #[arg(long)]
         out: Option<PathBuf>,
+        #[arg(long)]
+        retention: Option<String>,
+        #[arg(long)]
+        keep: Option<usize>,
     },
     InstallTimer {
         #[arg(long, default_value = "daily")]
@@ -630,6 +653,14 @@ fn main() -> Result<()> {
                 let app = find_app(&store, &client, &slug)?;
                 let container = container_for_app(&app)?;
                 docker::shell(&container, &shell)?;
+            }
+            AppSubcommand::Health { client, slug } => {
+                let app = find_app(&store, &client, &slug)?;
+                let checks = app_health(&cfg, &store, &app)?;
+                print_health_checks(&checks);
+                if checks.iter().any(|check| !check.ok) {
+                    std::process::exit(1);
+                }
             }
         },
         Command::Ssh(cmd) => match cmd.command {
@@ -968,6 +999,43 @@ fn main() -> Result<()> {
                     println!("restore aplicado: {} <- {}", database, dump.display());
                 }
             }
+            DbSubcommand::RestoreLatest {
+                server,
+                database,
+                yes,
+                dry_run,
+                out,
+                no_pre_backup,
+            } => {
+                let out_dir = out.unwrap_or_else(|| cfg.backup_dir.clone());
+                let server = store.db_server(&server)?;
+                let dump =
+                    backup::latest_backup(&out_dir, &server.name, &database)?.ok_or_else(|| {
+                        color_eyre::eyre::eyre!(
+                            "no hay backups para {}/{} en {}",
+                            server.name,
+                            database,
+                            out_dir.display()
+                        )
+                    })?;
+
+                if dry_run {
+                    backup::dry_run_restore(&cfg, &server, &database, &dump)?;
+                    println!("dry-run OK: {} <- {}", database, dump.display());
+                } else {
+                    if !yes {
+                        bail!(
+                            "restore-latest requiere --yes; usa --dry-run para validar sin aplicar"
+                        );
+                    }
+                    if !no_pre_backup {
+                        let pre = backup::backup(&cfg, &server, &database, &out_dir)?;
+                        println!("backup pre-restore: {}", pre.display());
+                    }
+                    backup::restore(&cfg, &server, &database, &dump)?;
+                    println!("restore aplicado: {} <- {}", database, dump.display());
+                }
+            }
             DbSubcommand::BackupList {
                 out,
                 server,
@@ -978,7 +1046,11 @@ fn main() -> Result<()> {
                     println!("{}", file.display());
                 }
             }
-            DbSubcommand::BackupAll { out } => {
+            DbSubcommand::BackupAll {
+                out,
+                retention,
+                keep,
+            } => {
                 let out_dir = out.unwrap_or_else(|| cfg.backup_dir.clone());
                 let grants = store.list_database_grants()?;
                 let mut seen = std::collections::HashSet::new();
@@ -1006,6 +1078,15 @@ fn main() -> Result<()> {
                             }
                         },
                     }
+                }
+                if retention.is_some() || keep.is_some() {
+                    let retention_days =
+                        retention.as_deref().map(parse_retention_days).transpose()?;
+                    let removed = backup::prune_backups(&out_dir, keep, retention_days)?;
+                    for file in &removed {
+                        println!("pruned {}", file.display());
+                    }
+                    println!("{} backups podados", removed.len());
                 }
                 println!("\n{} backups OK, {} errores", ok, errs);
                 if errs > 0 {
@@ -1232,6 +1313,172 @@ fn print_status(cfg: &Config, store: &Store) -> Result<()> {
     println!("db servers: {}", store.list_db_servers()?.len());
     println!("db grants:  {}", store.list_database_grants()?.len());
     Ok(())
+}
+
+struct HealthCheck {
+    name: String,
+    ok: bool,
+    detail: String,
+}
+
+impl HealthCheck {
+    fn ok(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ok: true,
+            detail: detail.into(),
+        }
+    }
+
+    fn fail(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ok: false,
+            detail: detail.into(),
+        }
+    }
+}
+
+fn app_health(cfg: &Config, store: &Store, app: &HostingApp) -> Result<Vec<HealthCheck>> {
+    let mut checks = Vec::new();
+
+    checks.push(match docker::container_name_from_upstream(&app.upstream) {
+        Some(container) => docker_container_health(&container),
+        None => HealthCheck::ok("container", "upstream externo/no Docker"),
+    });
+    checks.push(https_health(&app.domain));
+    checks.push(caddy_route_health(&cfg.caddy_managed_path, &app.domain));
+
+    let grants: Vec<_> = store
+        .list_database_grants()?
+        .into_iter()
+        .filter(|grant| {
+            grant.client_slug == app.client_slug
+                && grant.app_slug.as_deref() == Some(app.slug.as_str())
+        })
+        .collect();
+    if grants.is_empty() {
+        checks.push(HealthCheck::fail("db grant", "sin DB asociada a la app"));
+        checks.push(HealthCheck::fail("backup", "sin DB asociada a la app"));
+    } else {
+        for grant in grants {
+            match store.db_server(&grant.server_name) {
+                Ok(server) => {
+                    checks.push(match db::check_connection(cfg, &server) {
+                        Ok(()) => HealthCheck::ok(
+                            format!("db {}", grant.db_name),
+                            format!("{} conecta", server.name),
+                        ),
+                        Err(err) => HealthCheck::fail(
+                            format!("db {}", grant.db_name),
+                            format!("{}: {err}", server.name),
+                        ),
+                    });
+                    checks.push(
+                        match backup::latest_backup(&cfg.backup_dir, &server.name, &grant.db_name)?
+                        {
+                            Some(path) => HealthCheck::ok(
+                                format!("backup {}", grant.db_name),
+                                path.display().to_string(),
+                            ),
+                            None => HealthCheck::fail(
+                                format!("backup {}", grant.db_name),
+                                format!("sin backup en {}", cfg.backup_dir.display()),
+                            ),
+                        },
+                    );
+                }
+                Err(err) => checks.push(HealthCheck::fail(
+                    format!("db {}", grant.db_name),
+                    format!("server no encontrado: {err}"),
+                )),
+            }
+        }
+    }
+
+    Ok(checks)
+}
+
+fn print_health_checks(checks: &[HealthCheck]) {
+    for check in checks {
+        let marker = if check.ok { "✓" } else { "✗" };
+        println!("{} {} — {}", marker, check.name, check.detail);
+    }
+    let failed = checks.iter().filter(|check| !check.ok).count();
+    println!("\n{} checks, {} failed", checks.len(), failed);
+}
+
+fn docker_container_health(container: &str) -> HealthCheck {
+    match ProcessCommand::new("docker")
+        .args(["inspect", "--format", "{{.State.Status}}", container])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if status == "running" {
+                HealthCheck::ok("container", format!("{container} running"))
+            } else {
+                HealthCheck::fail("container", format!("{container} {status}"))
+            }
+        }
+        Ok(output) => HealthCheck::fail(
+            "container",
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ),
+        Err(err) => HealthCheck::fail("container", err.to_string()),
+    }
+}
+
+fn https_health(domain: &str) -> HealthCheck {
+    let url = format!("https://{domain}");
+    match ProcessCommand::new("curl")
+        .args([
+            "-L",
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "10",
+            &url,
+        ])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if code.starts_with('2') || code.starts_with('3') {
+                HealthCheck::ok("https", format!("{url} -> {code}"))
+            } else {
+                HealthCheck::fail("https", format!("{url} -> {code}"))
+            }
+        }
+        Ok(output) => HealthCheck::fail(
+            "https",
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ),
+        Err(err) => HealthCheck::fail("https", err.to_string()),
+    }
+}
+
+fn caddy_route_health(path: &Path, domain: &str) -> HealthCheck {
+    match std::fs::read_to_string(path) {
+        Ok(raw) if raw.contains(domain) => HealthCheck::ok("caddy", path.display().to_string()),
+        Ok(_) => HealthCheck::fail("caddy", format!("{} no contiene {domain}", path.display())),
+        Err(err) => HealthCheck::fail("caddy", err.to_string()),
+    }
+}
+
+fn parse_retention_days(value: &str) -> Result<u64> {
+    let raw = value.trim();
+    let days = raw.strip_suffix('d').unwrap_or(raw);
+    let days = days
+        .parse::<u64>()
+        .map_err(|_| color_eyre::eyre::eyre!("retention inválida `{value}`; usa ej: 14d"))?;
+    if days == 0 {
+        bail!("retention debe ser mayor a 0 días");
+    }
+    Ok(days)
 }
 
 fn resolve_password(password: Option<String>, generate: bool) -> Result<String> {
@@ -1522,5 +1769,81 @@ mod tests {
             },
             _ => panic!("expected wp canonicalize-domain"),
         }
+    }
+
+    #[test]
+    fn cli_parses_app_health() {
+        let cli = Cli::parse_from(["hostingctl", "app", "health", "client", "web"]);
+
+        match cli.command {
+            Command::App(cmd) => match cmd.command {
+                AppSubcommand::Health { client, slug } => {
+                    assert_eq!(client, "client");
+                    assert_eq!(slug, "web");
+                }
+                _ => panic!("expected app health"),
+            },
+            _ => panic!("expected app health"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_backup_retention_and_restore_latest() {
+        let backup = Cli::parse_from([
+            "hostingctl",
+            "db",
+            "backup-all",
+            "--retention",
+            "14d",
+            "--keep",
+            "3",
+        ]);
+        match backup.command {
+            Command::Db(cmd) => match cmd.command {
+                DbSubcommand::BackupAll {
+                    retention, keep, ..
+                } => {
+                    assert_eq!(retention.as_deref(), Some("14d"));
+                    assert_eq!(keep, Some(3));
+                }
+                _ => panic!("expected db backup-all"),
+            },
+            _ => panic!("expected db backup-all"),
+        }
+
+        let restore = Cli::parse_from([
+            "hostingctl",
+            "db",
+            "restore-latest",
+            "mariadb",
+            "app_db",
+            "--dry-run",
+        ]);
+        match restore.command {
+            Command::Db(cmd) => match cmd.command {
+                DbSubcommand::RestoreLatest {
+                    server,
+                    database,
+                    dry_run,
+                    no_pre_backup,
+                    ..
+                } => {
+                    assert_eq!(server, "mariadb");
+                    assert_eq!(database, "app_db");
+                    assert!(dry_run);
+                    assert!(!no_pre_backup);
+                }
+                _ => panic!("expected db restore-latest"),
+            },
+            _ => panic!("expected db restore-latest"),
+        }
+    }
+
+    #[test]
+    fn parse_retention_days_accepts_days_suffix() {
+        assert_eq!(parse_retention_days("14d").unwrap(), 14);
+        assert_eq!(parse_retention_days("7").unwrap(), 7);
+        assert!(parse_retention_days("0d").is_err());
+        assert!(parse_retention_days("two-weeks").is_err());
     }
 }

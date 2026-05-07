@@ -38,6 +38,7 @@ cargo run -- tui
 ```sh
 hostingctl status
 hostingctl doctor
+hostingctl app health porteroseguro web
 ```
 
 `doctor` valida Docker, contenedores, Caddyfile/import, credenciales DB y conexión MariaDB.
@@ -144,10 +145,15 @@ Backup/restore local usando `docker exec <server>` y `mariadb-dump`/`mariadb` de
 
 ```sh
 hostingctl db backup mariadb porteroseguro_web_prod --out ./backups
+hostingctl db backup-all --retention 14d --keep 3
 hostingctl db backup-list --out ./backups --server mariadb --database porteroseguro_web_prod
 hostingctl db restore mariadb porteroseguro_web_prod ./backups/mariadb/porteroseguro_web_prod/20260504-153000.sql.gz --dry-run
 hostingctl db restore mariadb porteroseguro_web_prod ./backups/mariadb/porteroseguro_web_prod/20260504-153000.sql.gz --yes
+hostingctl db restore-latest mariadb porteroseguro_web_prod --dry-run
+hostingctl db restore-latest mariadb porteroseguro_web_prod --yes
 ```
+
+`restore-latest --yes` crea un backup pre-restore automáticamente salvo que uses `--no-pre-backup`.
 
 El backup genera `.sql.gz` en:
 
