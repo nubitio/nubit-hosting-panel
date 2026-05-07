@@ -65,6 +65,45 @@ pub struct ProvisionSummary {
     pub password: String,
 }
 
+#[derive(Debug)]
+pub struct HardenSummary {
+    pub site_dir: PathBuf,
+    pub html_dir: PathBuf,
+    pub wp_config_hardened: bool,
+    pub permissions_normalized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl CheckStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditCheck {
+    pub status: CheckStatus,
+    pub name: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanFinding {
+    pub status: CheckStatus,
+    pub path: PathBuf,
+    pub detail: String,
+}
+
 pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<ProvisionSummary> {
     validate_slug(&opts.client)?;
     validate_slug(&opts.slug)?;
@@ -132,6 +171,7 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
     docker::ensure_network(&opts.network)?;
     docker::compose_pull(&site_dir)?;
     docker::compose_up(&site_dir)?;
+    harden_html_dir(&html_dir)?;
 
     if let Some(dump) = dump_path {
         backup::restore(cfg, &server, &provisioned.database, dump)
@@ -179,6 +219,56 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
         username: provisioned.username,
         password: provisioned.password,
     })
+}
+
+pub fn harden_site(sites_dir: &Path, client: &str, slug: &str) -> Result<HardenSummary> {
+    validate_slug(client)?;
+    validate_slug(slug)?;
+    let site_dir = sites_dir.join(client).join(slug);
+    let html_dir = site_dir.join("html");
+    if !html_dir.is_dir() {
+        bail!("html dir no existe: {}", html_dir.display());
+    }
+    let wp_config_hardened = harden_wp_config(&html_dir)?;
+    normalize_wp_permissions(&html_dir)?;
+    Ok(HardenSummary {
+        site_dir,
+        html_dir,
+        wp_config_hardened,
+        permissions_normalized: true,
+    })
+}
+
+pub fn audit_site(sites_dir: &Path, client: &str, slug: &str) -> Result<Vec<AuditCheck>> {
+    validate_slug(client)?;
+    validate_slug(slug)?;
+    let html_dir = sites_dir.join(client).join(slug).join("html");
+    if !html_dir.is_dir() {
+        bail!("html dir no existe: {}", html_dir.display());
+    }
+
+    let mut checks = Vec::new();
+    audit_wp_config(&html_dir, &mut checks)?;
+    audit_permissions(&html_dir, &mut checks)?;
+    audit_risky_files(&html_dir, &mut checks)?;
+    audit_uploads_php(&html_dir, &mut checks)?;
+    Ok(checks)
+}
+
+pub fn scan_site(sites_dir: &Path, client: &str, slug: &str) -> Result<Vec<ScanFinding>> {
+    validate_slug(client)?;
+    validate_slug(slug)?;
+    let html_dir = sites_dir.join(client).join(slug).join("html");
+    if !html_dir.is_dir() {
+        bail!("html dir no existe: {}", html_dir.display());
+    }
+
+    let mut findings = Vec::new();
+    collect_files(&html_dir, &mut |path| {
+        scan_file(&html_dir, path, &mut findings)?;
+        Ok(())
+    })?;
+    Ok(findings)
 }
 
 fn provision_database_without_app_link(
@@ -567,6 +657,13 @@ fn normalize_wp_permissions(html_dir: &Path) -> Result<()> {
 
     normalize_path_permissions(html_dir)?;
     collect_paths(html_dir, &mut |path| normalize_path_permissions(path))?;
+    let wp_config = html_dir.join("wp-config.php");
+    if wp_config.is_file() {
+        let mut permissions = fs::metadata(&wp_config)?.permissions();
+        permissions.set_mode(0o640);
+        fs::set_permissions(&wp_config, permissions)
+            .wrap_err_with(|| format!("ajustando permisos de {}", wp_config.display()))?;
+    }
     Ok(())
 }
 
@@ -596,6 +693,248 @@ where
         if path.is_dir() {
             collect_paths(&path, visit)?;
         }
+    }
+    Ok(())
+}
+
+fn harden_html_dir(html_dir: &Path) -> Result<()> {
+    harden_wp_config(html_dir)?;
+    normalize_wp_permissions(html_dir)?;
+    Ok(())
+}
+
+fn harden_wp_config(html_dir: &Path) -> Result<bool> {
+    let path = html_dir.join("wp-config.php");
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let raw = fs::read_to_string(&path).wrap_err_with(|| format!("leyendo {}", path.display()))?;
+    let mut additions = Vec::new();
+    if !raw.contains("DISALLOW_FILE_EDIT") {
+        additions.push("define('DISALLOW_FILE_EDIT', true);");
+    }
+    if !raw.contains("WP_AUTO_UPDATE_CORE") {
+        additions.push("define('WP_AUTO_UPDATE_CORE', 'minor');");
+    }
+    if additions.is_empty() {
+        return Ok(false);
+    }
+
+    let block = format!(
+        "\n// Managed by hostingctl WordPress hardening.\n{}\n",
+        additions.join("\n")
+    );
+    let next = if let Some(idx) = raw.find("/* That's all, stop editing") {
+        let mut next = String::with_capacity(raw.len() + block.len());
+        next.push_str(&raw[..idx]);
+        next.push_str(&block);
+        next.push_str(&raw[idx..]);
+        next
+    } else {
+        let mut next = raw.trim_end().to_string();
+        next.push_str(&block);
+        next.push('\n');
+        next
+    };
+    fs::write(&path, next).wrap_err_with(|| format!("escribiendo {}", path.display()))?;
+    Ok(true)
+}
+
+fn audit_wp_config(html_dir: &Path, checks: &mut Vec<AuditCheck>) -> Result<()> {
+    let path = html_dir.join("wp-config.php");
+    if !path.is_file() {
+        checks.push(AuditCheck {
+            status: CheckStatus::Warn,
+            name: "wp-config.php".to_string(),
+            detail: "no encontrado; puede estar generado por la imagen o faltar en migración"
+                .to_string(),
+        });
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&path).wrap_err_with(|| format!("leyendo {}", path.display()))?;
+    checks.push(AuditCheck {
+        status: if raw.contains("DISALLOW_FILE_EDIT") {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        name: "DISALLOW_FILE_EDIT".to_string(),
+        detail: if raw.contains("DISALLOW_FILE_EDIT") {
+            "editor de archivos desde wp-admin deshabilitado".to_string()
+        } else {
+            "falta define('DISALLOW_FILE_EDIT', true)".to_string()
+        },
+    });
+    checks.push(AuditCheck {
+        status: if raw.contains("WP_AUTO_UPDATE_CORE") {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        name: "WP_AUTO_UPDATE_CORE".to_string(),
+        detail: if raw.contains("WP_AUTO_UPDATE_CORE") {
+            "auto-update core configurado".to_string()
+        } else {
+            "falta política explícita de auto-update core".to_string()
+        },
+    });
+    Ok(())
+}
+
+fn audit_permissions(html_dir: &Path, checks: &mut Vec<AuditCheck>) -> Result<()> {
+    let mut bad_dirs = 0;
+    let mut bad_files = 0;
+    collect_paths(html_dir, &mut |path| {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.is_dir() {
+            if mode & 0o022 != 0 || mode & 0o111 != 0o111 {
+                bad_dirs += 1;
+            }
+        } else if mode & 0o022 != 0 || mode & 0o444 != 0o444 {
+            bad_files += 1;
+        }
+        Ok(())
+    })?;
+    let wp_config = html_dir.join("wp-config.php");
+    let wp_config_mode = fs::metadata(&wp_config)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777);
+    checks.push(AuditCheck {
+        status: if bad_dirs == 0 && bad_files == 0 {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        name: "permisos árbol html".to_string(),
+        detail: format!("dirs inseguros: {bad_dirs}, files inseguros: {bad_files}"),
+    });
+    if let Some(mode) = wp_config_mode {
+        checks.push(AuditCheck {
+            status: if mode <= 0o640 {
+                CheckStatus::Pass
+            } else {
+                CheckStatus::Warn
+            },
+            name: "permisos wp-config.php".to_string(),
+            detail: format!("modo actual: {mode:o}; recomendado <= 640"),
+        });
+    }
+    Ok(())
+}
+
+fn audit_risky_files(html_dir: &Path, checks: &mut Vec<AuditCheck>) -> Result<()> {
+    let risky = [".env", "readme.html", "license.txt"];
+    let found: Vec<_> = risky
+        .iter()
+        .filter(|name| html_dir.join(name).exists())
+        .map(|name| name.to_string())
+        .collect();
+    checks.push(AuditCheck {
+        status: if found.is_empty() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        name: "archivos públicos riesgosos".to_string(),
+        detail: if found.is_empty() {
+            "no detectados".to_string()
+        } else {
+            found.join(", ")
+        },
+    });
+    Ok(())
+}
+
+fn audit_uploads_php(html_dir: &Path, checks: &mut Vec<AuditCheck>) -> Result<()> {
+    let uploads = html_dir.join("wp-content").join("uploads");
+    if !uploads.is_dir() {
+        checks.push(AuditCheck {
+            status: CheckStatus::Pass,
+            name: "PHP en uploads".to_string(),
+            detail: "uploads no existe o no tiene PHP".to_string(),
+        });
+        return Ok(());
+    }
+    let mut count = 0;
+    collect_files(&uploads, &mut |path| {
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("php"))
+            .unwrap_or(false)
+        {
+            count += 1;
+        }
+        Ok(())
+    })?;
+    checks.push(AuditCheck {
+        status: if count == 0 {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
+        name: "PHP en uploads".to_string(),
+        detail: format!("archivos PHP encontrados: {count}"),
+    });
+    Ok(())
+}
+
+fn scan_file(html_dir: &Path, path: &Path, findings: &mut Vec<ScanFinding>) -> Result<()> {
+    let rel = path.strip_prefix(html_dir).unwrap_or(path).to_path_buf();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let in_uploads = rel.starts_with(Path::new("wp-content/uploads"));
+    if in_uploads && ext == "php" {
+        findings.push(ScanFinding {
+            status: CheckStatus::Fail,
+            path: rel.clone(),
+            detail: "archivo PHP dentro de uploads".to_string(),
+        });
+    }
+
+    let should_scan_text = matches!(
+        ext.as_str(),
+        "php" | "phtml" | "js" | "txt" | "ico" | "jpg" | "jpeg" | "png" | "gif"
+    ) && fs::metadata(path)
+        .map(|m| m.len() <= 2_000_000)
+        .unwrap_or(false);
+    if !should_scan_text {
+        return Ok(());
+    }
+    let bytes = fs::read(path).wrap_err_with(|| format!("leyendo {}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+    let patterns = [
+        "eval(",
+        "base64_decode(",
+        "gzinflate(",
+        "shell_exec(",
+        "passthru(",
+        "assert(",
+        "preg_replace('/.*/e",
+        "filesman",
+        "c99shell",
+        "r57shell",
+    ];
+    let matched: Vec<_> = patterns
+        .iter()
+        .filter(|p| text.contains(**p))
+        .copied()
+        .collect();
+    if !matched.is_empty() {
+        findings.push(ScanFinding {
+            status: CheckStatus::Warn,
+            path: rel,
+            detail: format!("patrones sospechosos: {}", matched.join(", ")),
+        });
     }
     Ok(())
 }
@@ -884,6 +1223,78 @@ mod tests {
                 .mode()
                 & 0o777,
             0o644
+        );
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn harden_wp_config_inserts_security_defines() {
+        let tmp = tempfile_dir("wp-config-harden");
+        let html = tmp.join("html");
+        fs::create_dir_all(&html).unwrap();
+        fs::write(
+            html.join("wp-config.php"),
+            "<?php\ndefine('DB_NAME', 'wp');\n/* That's all, stop editing! Happy publishing. */\n",
+        )
+        .unwrap();
+
+        assert!(harden_wp_config(&html).unwrap());
+        assert!(!harden_wp_config(&html).unwrap());
+
+        let raw = fs::read_to_string(html.join("wp-config.php")).unwrap();
+        assert!(raw.contains("define('DISALLOW_FILE_EDIT', true);"));
+        assert!(raw.contains("define('WP_AUTO_UPDATE_CORE', 'minor');"));
+        assert_eq!(raw.matches("DISALLOW_FILE_EDIT").count(), 1);
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn audit_site_reports_uploads_php_as_fail() {
+        let tmp = tempfile_dir("wp-audit");
+        let html = tmp.join("client").join("web").join("html");
+        fs::create_dir_all(html.join("wp-content").join("uploads")).unwrap();
+        fs::write(
+            html.join("wp-config.php"),
+            "<?php define('DISALLOW_FILE_EDIT', true); define('WP_AUTO_UPDATE_CORE', 'minor');",
+        )
+        .unwrap();
+        fs::write(
+            html.join("wp-content").join("uploads").join("shell.php"),
+            "<?php",
+        )
+        .unwrap();
+
+        let checks = audit_site(&tmp, "client", "web").unwrap();
+
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.name == "PHP en uploads" && check.status == CheckStatus::Fail)
+        );
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn scan_site_detects_suspicious_patterns() {
+        let tmp = tempfile_dir("wp-scan");
+        let html = tmp.join("client").join("web").join("html");
+        fs::create_dir_all(html.join("wp-content").join("uploads")).unwrap();
+        fs::write(
+            html.join("wp-content").join("uploads").join("shell.php"),
+            "<?php eval(base64_decode($_POST['x']));",
+        )
+        .unwrap();
+
+        let findings = scan_site(&tmp, "client", "web").unwrap();
+
+        assert!(findings.iter().any(
+            |finding| finding.status == CheckStatus::Fail && finding.detail.contains("uploads")
+        ));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.status == CheckStatus::Warn
+                    && finding.detail.contains("base64_decode"))
         );
         let _ = fs::remove_dir_all(tmp);
     }

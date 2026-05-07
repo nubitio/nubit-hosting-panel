@@ -264,6 +264,7 @@ struct WpCommand {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum WpSubcommand {
     /// Crea o migra un sitio WordPress con DB, compose y app proxy
     Provision {
@@ -301,6 +302,31 @@ enum WpSubcommand {
         no_apply_caddy: bool,
         #[arg(long = "no-reload-caddy", default_value_t = false)]
         no_reload_caddy: bool,
+    },
+    /// Aplica hardening de seguridad a un sitio WordPress existente
+    Harden {
+        client: String,
+        slug: String,
+        #[arg(long)]
+        sites_dir: Option<PathBuf>,
+        #[arg(long = "no-apply-caddy", default_value_t = false)]
+        no_apply_caddy: bool,
+        #[arg(long = "no-reload-caddy", default_value_t = false)]
+        no_reload_caddy: bool,
+    },
+    /// Audita hardening y permisos de un sitio WordPress
+    Audit {
+        client: String,
+        slug: String,
+        #[arg(long)]
+        sites_dir: Option<PathBuf>,
+    },
+    /// Escanea archivos WordPress buscando indicadores básicos de malware
+    Scan {
+        client: String,
+        slug: String,
+        #[arg(long)]
+        sites_dir: Option<PathBuf>,
     },
 }
 
@@ -1058,6 +1084,89 @@ fn main() -> Result<()> {
                     println!("siguiente: hostingctl caddy apply --reload");
                 }
             }
+            WpSubcommand::Harden {
+                client,
+                slug,
+                sites_dir,
+                no_apply_caddy,
+                no_reload_caddy,
+            } => {
+                let summary = wp::harden_site(
+                    &sites_dir.unwrap_or_else(|| cfg.wp_sites_dir.clone()),
+                    &client,
+                    &slug,
+                )?;
+                println!("WordPress harden aplicado: {}/{}", client, slug);
+                println!("site:        {}", summary.site_dir.display());
+                println!("html:        {}", summary.html_dir.display());
+                println!(
+                    "wp-config:   {}",
+                    if summary.wp_config_hardened {
+                        "updated"
+                    } else {
+                        "sin cambios/no encontrado"
+                    }
+                );
+                println!(
+                    "permisos:    {}",
+                    if summary.permissions_normalized {
+                        "normalizados"
+                    } else {
+                        "sin cambios"
+                    }
+                );
+                if !no_apply_caddy {
+                    caddy::apply(
+                        &cfg,
+                        &store.list_apps()?,
+                        &store.list_domain_aliases()?,
+                        !no_reload_caddy,
+                    )?;
+                    println!("caddy:       aplicado");
+                }
+            }
+            WpSubcommand::Audit {
+                client,
+                slug,
+                sites_dir,
+            } => {
+                let checks = wp::audit_site(
+                    &sites_dir.unwrap_or_else(|| cfg.wp_sites_dir.clone()),
+                    &client,
+                    &slug,
+                )?;
+                for check in checks {
+                    println!(
+                        "{}\t{}\t{}",
+                        check.status.as_str(),
+                        check.name,
+                        check.detail
+                    );
+                }
+            }
+            WpSubcommand::Scan {
+                client,
+                slug,
+                sites_dir,
+            } => {
+                let findings = wp::scan_site(
+                    &sites_dir.unwrap_or_else(|| cfg.wp_sites_dir.clone()),
+                    &client,
+                    &slug,
+                )?;
+                if findings.is_empty() {
+                    println!("PASS\tscan\tsin indicadores básicos detectados");
+                } else {
+                    for finding in findings {
+                        println!(
+                            "{}\t{}\t{}",
+                            finding.status.as_str(),
+                            finding.path.display(),
+                            finding.detail
+                        );
+                    }
+                }
+            }
         },
     }
 
@@ -1227,6 +1336,7 @@ mod tests {
                     assert_eq!(db_server, "mariadb");
                     assert_eq!(mode, "fresh");
                 }
+                _ => panic!("expected wp provision"),
             },
             _ => panic!("expected wp provision"),
         }
@@ -1273,8 +1383,65 @@ mod tests {
                     assert_eq!(old_domain.as_deref(), Some("old.example.com"));
                     assert!(no_apply_caddy);
                 }
+                _ => panic!("expected wp provision"),
             },
             _ => panic!("expected wp provision"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_wp_harden() {
+        let cli = Cli::parse_from([
+            "hostingctl",
+            "wp",
+            "harden",
+            "client",
+            "web",
+            "--no-reload-caddy",
+        ]);
+
+        match cli.command {
+            Command::Wp(cmd) => match cmd.command {
+                WpSubcommand::Harden {
+                    client,
+                    slug,
+                    no_reload_caddy,
+                    ..
+                } => {
+                    assert_eq!(client, "client");
+                    assert_eq!(slug, "web");
+                    assert!(no_reload_caddy);
+                }
+                _ => panic!("expected wp harden"),
+            },
+            _ => panic!("expected wp harden"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_wp_audit_and_scan() {
+        let audit = Cli::parse_from(["hostingctl", "wp", "audit", "client", "web"]);
+        match audit.command {
+            Command::Wp(cmd) => match cmd.command {
+                WpSubcommand::Audit { client, slug, .. } => {
+                    assert_eq!(client, "client");
+                    assert_eq!(slug, "web");
+                }
+                _ => panic!("expected wp audit"),
+            },
+            _ => panic!("expected wp audit"),
+        }
+
+        let scan = Cli::parse_from(["hostingctl", "wp", "scan", "client", "web"]);
+        match scan.command {
+            Command::Wp(cmd) => match cmd.command {
+                WpSubcommand::Scan { client, slug, .. } => {
+                    assert_eq!(client, "client");
+                    assert_eq!(slug, "web");
+                }
+                _ => panic!("expected wp scan"),
+            },
+            _ => panic!("expected wp scan"),
         }
     }
 }

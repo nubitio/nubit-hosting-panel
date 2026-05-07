@@ -32,12 +32,14 @@ pub fn render_block(apps: &[App], aliases: &[DomainAlias]) -> String {
         } else {
             format!("{} {}", app.domain, extra.join(" "))
         };
+        let hardening = render_wordpress_hardening(&app.upstream);
         let proxy = render_proxy(&app.upstream);
         out.push_str(&format!(
-            "# client: {client} app: {slug}\n{domains} {{\n  encode zstd gzip\n{proxy}\n}}\n\n",
+            "# client: {client} app: {slug}\n{domains} {{\n  encode zstd gzip\n{hardening}{proxy}\n}}\n\n",
             client = app.client_slug,
             slug = app.slug,
             domains = domains,
+            hardening = hardening,
         ));
     }
     out
@@ -56,6 +58,19 @@ fn render_proxy(upstream: &str) -> String {
     } else {
         format!("  reverse_proxy {upstream}")
     }
+}
+
+fn render_wordpress_hardening(upstream: &str) -> String {
+    if !is_wordpress_upstream(upstream) {
+        return String::new();
+    }
+
+    "  header {\n    X-Content-Type-Options nosniff\n    X-Frame-Options SAMEORIGIN\n    Referrer-Policy strict-origin-when-cross-origin\n  }\n  @wp_sensitive_path {\n    path /.env /.git* /wp-config.php /readme.html /license.txt /xmlrpc.php\n  }\n  respond @wp_sensitive_path 403\n  @wp_sensitive_ext {\n    path_regexp (?i).*[.](sql|sql[.]gz|tar|tar[.]gz|tgz|zip|bak)$\n  }\n  respond @wp_sensitive_ext 403\n  @wp_uploads_php {\n    path /wp-content/uploads/*.php /wp-content/uploads/*/*.php /wp-content/uploads/*/*/*.php /wp-content/uploads/*/*/*/*.php\n  }\n  respond @wp_uploads_php 403\n"
+        .to_string()
+}
+
+fn is_wordpress_upstream(upstream: &str) -> bool {
+    upstream.contains("_wordpress") || upstream.contains("wordpress")
 }
 
 pub fn bootstrap(cfg: &Config) -> Result<bool> {
@@ -241,10 +256,31 @@ mod tests {
         assert!(
             rendered.contains("www.dimexa.com.pe {\n  redir https://dimexa.com.pe{uri} permanent")
         );
-        assert!(
-            rendered.contains(
-                "dimexa.com.pe {\n  encode zstd gzip\n  reverse_proxy dimexa_wordpress:80"
-            )
+        assert!(rendered.contains("dimexa.com.pe {\n  encode zstd gzip"));
+        assert!(rendered.contains("reverse_proxy dimexa_wordpress:80"));
+    }
+
+    #[test]
+    fn render_block_adds_wordpress_security_rules() {
+        let rendered = render_block(
+            &[App {
+                id: "app-1".into(),
+                client_slug: "client".into(),
+                slug: "web".into(),
+                domain: "example.com".into(),
+                upstream: "client_web_wordpress:80".into(),
+                notes: None,
+                created_at: Utc::now(),
+            }],
+            &[],
         );
+
+        assert!(rendered.contains("X-Content-Type-Options nosniff"));
+        assert!(
+            rendered
+                .contains("path /.env /.git* /wp-config.php /readme.html /license.txt /xmlrpc.php")
+        );
+        assert!(rendered.contains("path_regexp (?i).*[.](sql|sql[.]gz|tar|tar[.]gz|tgz|zip|bak)$"));
+        assert!(rendered.contains("/wp-content/uploads/*.php"));
     }
 }
