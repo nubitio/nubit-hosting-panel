@@ -136,11 +136,6 @@ fn mariadb_restore(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    eprintln!(
-        "[restore] docker exec {} mariadb -u {} {}",
-        server.name, creds.username, database,
-    );
-
     let mut child = cmd.spawn().wrap_err("ejecutando mariadb vía docker exec")?;
     {
         let stdin = child

@@ -128,13 +128,18 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
 
     docker::ensure_network(&opts.network)?;
     docker::compose_pull(&site_dir)?;
+
+    // Primera arrancada: WordPress inicializa la DB (crea tablas vacías).
+    // Luego lo detenemos, importamos el dump encima, y lo volvemos a levantar.
     docker::compose_up(&site_dir)?;
 
-    // Importamos el dump DESPUÉS de compose_up para evitar que el entrypoint
-    // de la imagen WordPress sobreescriba o limpie la DB al inicializar.
     if let Some(dump) = dump_path {
+        // Detenemos el contenedor para que no interfiera con el import.
+        docker::compose_stop(&site_dir)?;
         backup::restore(cfg, &server, &provisioned.database, dump)
             .wrap_err_with(|| format!("importando dump {}", dump.display()))?;
+        // Volvemos a levantar con los datos ya importados.
+        docker::compose_up(&site_dir)?;
     }
 
     ensure_app_registered(store, &opts.client, &opts.slug, &opts.domain, &upstream)?;

@@ -116,6 +116,19 @@ pub fn ensure_network(network: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn compose_stop(project_dir: &std::path::Path) -> Result<()> {
+    let status = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(project_dir.join("compose.yml"))
+        .arg("stop")
+        .status()?;
+    if !status.success() {
+        bail!("docker compose stop falló en {}", project_dir.display());
+    }
+    Ok(())
+}
+
 pub fn compose_up(project_dir: &std::path::Path) -> Result<()> {
     let status = Command::new("docker")
         .arg("compose")
