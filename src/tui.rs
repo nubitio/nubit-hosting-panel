@@ -1818,7 +1818,7 @@ fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
                     let opts =
                         wp_options_from_base(cfg, &data[0], &data[1], &data[2], &data[3], mode);
                     let title = format!(" WordPress {}/{} ", opts.client, opts.slug);
-                    state.modal = spawn_wp_job(cfg.clone(), opts, title);
+                    state.modal = spawn_wp_job(opts, title);
                 }
                 wp::ProvisionMode::Existing => {
                     state.modal = Modal::Form {
@@ -1863,7 +1863,7 @@ fn try_submit(state: &mut TuiState, store: &Store, cfg: &Config) -> Result<()> {
             opts.reuse_existing_files = data[3] == "yes";
             opts.old_domain = optional_string(&data[4]);
             let title = format!(" WordPress {}/{} ", opts.client, opts.slug);
-            state.modal = spawn_wp_job(cfg.clone(), opts, title);
+            state.modal = spawn_wp_job(opts, title);
         }
         FormKind::AddDbServer => {
             let port: u16 = data[3]
@@ -2307,58 +2307,68 @@ fn decode_wp_base(payload: &str) -> Option<(String, String, String, String)> {
     ))
 }
 
-fn spawn_wp_job(cfg: Config, opts: wp::ProvisionOptions, title: String) -> Modal {
+fn spawn_wp_job(opts: wp::ProvisionOptions, title: String) -> Modal {
     let (tx, rx) = mpsc::channel();
+    let args = wp_provision_args(&opts);
     let initial_lines = vec![
         format!("cliente/app: {}/{}", opts.client, opts.slug),
         format!("domain:      {}", opts.domain),
         format!("db server:   {}", opts.db_server),
         format!("mode:        {:?}", opts.mode),
         format!("image:       {}", opts.image),
-        "iniciando provision async...".to_string(),
+        "iniciando provision async con salida capturada...".to_string(),
     ];
     std::thread::spawn(move || {
-        let _ = tx.send(JobEvent::Line("abriendo store...".to_string()));
-        let store = match Store::open(&cfg.db_path()) {
-            Ok(store) => store,
+        let _ = tx.send(JobEvent::Line(
+            "ejecutando hostingctl wp provision...".to_string(),
+        ));
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
             Err(e) => {
                 let _ = tx.send(JobEvent::Done {
                     success: false,
                     title: "✗ WordPress falló".to_string(),
-                    lines: vec![format!("error abriendo store: {e}")],
+                    lines: vec![format!("no se pudo resolver executable actual: {e}")],
                 });
                 return;
             }
         };
-        let _ = tx.send(JobEvent::Line("provisionando WordPress...".to_string()));
-        match wp::provision(&cfg, &store, opts) {
-            Ok(summary) => {
-                let _ = tx.send(JobEvent::Done {
-                    success: true,
-                    title: "✓ WordPress Provisionado".to_string(),
-                    lines: vec![
-                        format!("Site dir:  {}", summary.site_dir.display()),
-                        format!("Compose:   {}", summary.compose_file.display()),
-                        format!("HTML:      {}", summary.html_dir.display()),
-                        format!("Container: {}", summary.container),
-                        format!("Upstream:  {}", summary.upstream),
-                        format!("Database:  {}", summary.database),
-                        format!("Usuario:   {}", summary.username),
-                        String::new(),
-                        format!("Password: {}", summary.password),
-                        String::new(),
-                        "Guarda el password, no se mostrará de nuevo.".to_string(),
-                    ],
-                });
-            }
+
+        let output = match std::process::Command::new(exe)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(output) => output,
             Err(e) => {
                 let _ = tx.send(JobEvent::Done {
                     success: false,
                     title: "✗ WordPress falló".to_string(),
-                    lines: vec![e.to_string()],
+                    lines: vec![format!("no se pudo ejecutar hostingctl: {e}")],
                 });
+                return;
             }
+        };
+
+        let mut lines = Vec::new();
+        push_output_lines(&mut lines, "stdout", &output.stdout);
+        push_output_lines(&mut lines, "stderr", &output.stderr);
+        if lines.is_empty() {
+            lines.push("sin output".to_string());
         }
+        let success = output.status.success();
+        lines.push(String::new());
+        lines.push(format!("exit status: {}", output.status));
+        let _ = tx.send(JobEvent::Done {
+            success,
+            title: if success {
+                "✓ WordPress Provisionado".to_string()
+            } else {
+                "✗ WordPress falló".to_string()
+            },
+            lines,
+        });
     });
     Modal::Job(JobModal {
         title,
@@ -2367,6 +2377,96 @@ fn spawn_wp_job(cfg: Config, opts: wp::ProvisionOptions, title: String) -> Modal
         success: false,
         rx,
     })
+}
+
+fn wp_provision_args(opts: &wp::ProvisionOptions) -> Vec<String> {
+    let mut args = vec![
+        "wp".to_string(),
+        "provision".to_string(),
+        opts.client.clone(),
+        opts.slug.clone(),
+        "--domain".to_string(),
+        opts.domain.clone(),
+        "--db-server".to_string(),
+        opts.db_server.clone(),
+        "--mode".to_string(),
+        match opts.mode {
+            wp::ProvisionMode::Fresh => "fresh".to_string(),
+            wp::ProvisionMode::Existing => "existing".to_string(),
+        },
+    ];
+
+    push_optional_path_arg(&mut args, "--bundle", opts.bundle.as_ref());
+    push_optional_path_arg(&mut args, "--archive", opts.archive.as_ref());
+    push_optional_path_arg(&mut args, "--dump", opts.dump.as_ref());
+    if opts.reuse_existing_files {
+        args.push("--reuse-existing-files".to_string());
+    }
+    if let Some(old_domain) = &opts.old_domain {
+        args.push("--old-domain".to_string());
+        args.push(old_domain.clone());
+    }
+    args.push("--sites-dir".to_string());
+    args.push(opts.sites_dir.display().to_string());
+    args.push("--network".to_string());
+    args.push(opts.network.clone());
+    args.push("--image".to_string());
+    args.push(opts.image.clone());
+    args.push("--cli-image".to_string());
+    args.push(opts.cli_image.clone());
+    args.push("--db-user-host".to_string());
+    args.push(opts.db_user_host.clone());
+    if let Some(wp_db_host) = &opts.wp_db_host {
+        args.push("--wp-db-host".to_string());
+        args.push(wp_db_host.clone());
+    }
+    if !opts.apply_caddy {
+        args.push("--no-apply-caddy".to_string());
+    }
+    if !opts.reload_caddy {
+        args.push("--no-reload-caddy".to_string());
+    }
+    args
+}
+
+fn push_optional_path_arg(args: &mut Vec<String>, flag: &str, path: Option<&PathBuf>) {
+    if let Some(path) = path {
+        args.push(flag.to_string());
+        args.push(path.display().to_string());
+    }
+}
+
+fn push_output_lines(lines: &mut Vec<String>, label: &str, bytes: &[u8]) {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(format!("[{label}]"));
+    for line in text.lines() {
+        push_wrapped_line(lines, line, 140);
+    }
+}
+
+fn push_wrapped_line(lines: &mut Vec<String>, line: &str, width: usize) {
+    if line.chars().count() <= width {
+        lines.push(line.to_string());
+        return;
+    }
+    let mut current = String::new();
+    for ch in line.chars() {
+        current.push(ch);
+        if current.chars().count() >= width {
+            lines.push(current);
+            current = String::new();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
 }
 
 fn spawn_logs_modal(app: &HostingApp) -> Result<LogsModal> {
@@ -3926,5 +4026,53 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
         y,
         width: w,
         height: h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wp_provision_args_include_existing_mode_options() {
+        let opts = wp::ProvisionOptions {
+            client: "dimexa".into(),
+            slug: "medillen".into(),
+            domain: "medillen.com.pe".into(),
+            db_server: "mariadb".into(),
+            mode: wp::ProvisionMode::Existing,
+            bundle: None,
+            archive: None,
+            dump: Some(PathBuf::from("/opt/hosting/imports/medillen.sql.gz")),
+            reuse_existing_files: true,
+            old_domain: Some("www.old.test".into()),
+            sites_dir: PathBuf::from("/opt/hosting/sites"),
+            network: "hosting".into(),
+            image: "wordpress:php8.5-apache".into(),
+            cli_image: "wordpress:cli".into(),
+            db_user_host: "%".into(),
+            wp_db_host: Some("mariadb:3306".into()),
+            apply_caddy: true,
+            reload_caddy: false,
+        };
+
+        let args = wp_provision_args(&opts);
+
+        assert_eq!(&args[0..4], ["wp", "provision", "dimexa", "medillen"]);
+        assert!(args.windows(2).any(|w| w == ["--mode", "existing"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--dump", "/opt/hosting/imports/medillen.sql.gz"])
+        );
+        assert!(args.iter().any(|arg| arg == "--reuse-existing-files"));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--old-domain", "www.old.test"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--wp-db-host", "mariadb:3306"])
+        );
+        assert!(args.iter().any(|arg| arg == "--no-reload-caddy"));
     }
 }
