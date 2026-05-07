@@ -328,6 +328,22 @@ enum WpSubcommand {
         #[arg(long)]
         sites_dir: Option<PathBuf>,
     },
+    /// Canonicaliza URLs WordPress a https://dominio sin www y purga caché
+    #[command(name = "domain", alias = "canonicalize-domain", alias = "canon")]
+    Domain {
+        client: String,
+        slug: String,
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        sites_dir: Option<PathBuf>,
+        #[arg(long)]
+        network: Option<String>,
+        #[arg(long)]
+        cli_image: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1167,6 +1183,36 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            WpSubcommand::Domain {
+                client,
+                slug,
+                domain,
+                sites_dir,
+                network,
+                cli_image,
+                dry_run,
+            } => {
+                let summary = wp::canonicalize_domain(wp::CanonicalizeDomainOptions {
+                    client: client.clone(),
+                    slug: slug.clone(),
+                    domain,
+                    sites_dir: sites_dir.unwrap_or_else(|| cfg.wp_sites_dir.clone()),
+                    network: network.unwrap_or_else(|| cfg.wp_network.clone()),
+                    cli_image: cli_image.unwrap_or_else(|| cfg.wp_cli_image.clone()),
+                    dry_run,
+                })?;
+                println!(
+                    "WordPress dominio canonicalizado: {}/{}{}",
+                    client,
+                    slug,
+                    if dry_run { " (dry-run)" } else { "" }
+                );
+                println!("site:      {}", summary.site_dir.display());
+                println!("canonical: {}", summary.canonical_url);
+                for step in summary.steps {
+                    println!("- {step}");
+                }
+            }
         },
     }
 
@@ -1442,6 +1488,39 @@ mod tests {
                 _ => panic!("expected wp scan"),
             },
             _ => panic!("expected wp scan"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_wp_canonicalize_domain() {
+        let cli = Cli::parse_from([
+            "hostingctl",
+            "wp",
+            "domain",
+            "client",
+            "web",
+            "--domain",
+            "www.example.com",
+            "--dry-run",
+        ]);
+
+        match cli.command {
+            Command::Wp(cmd) => match cmd.command {
+                WpSubcommand::Domain {
+                    client,
+                    slug,
+                    domain,
+                    dry_run,
+                    ..
+                } => {
+                    assert_eq!(client, "client");
+                    assert_eq!(slug, "web");
+                    assert_eq!(domain, "www.example.com");
+                    assert!(dry_run);
+                }
+                _ => panic!("expected wp canonicalize-domain"),
+            },
+            _ => panic!("expected wp canonicalize-domain"),
         }
     }
 }

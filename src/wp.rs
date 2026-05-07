@@ -104,6 +104,24 @@ pub struct ScanFinding {
     pub detail: String,
 }
 
+#[derive(Debug)]
+pub struct CanonicalizeDomainOptions {
+    pub client: String,
+    pub slug: String,
+    pub domain: String,
+    pub sites_dir: PathBuf,
+    pub network: String,
+    pub cli_image: String,
+    pub dry_run: bool,
+}
+
+#[derive(Debug)]
+pub struct CanonicalizeDomainSummary {
+    pub site_dir: PathBuf,
+    pub canonical_url: String,
+    pub steps: Vec<String>,
+}
+
 pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<ProvisionSummary> {
     validate_slug(&opts.client)?;
     validate_slug(&opts.slug)?;
@@ -200,6 +218,19 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
         run_search_replace(&site_dir, &opts, old_domain, &canonical_domain)?;
     }
 
+    if opts.mode == ProvisionMode::Existing {
+        canonicalize_domain_at_site(
+            &site_dir,
+            &opts.network,
+            &opts.cli_image,
+            &canonical_domain,
+            false,
+        )
+        .wrap_err_with(|| {
+            format!("canonicalizando dominio WordPress a https://{canonical_domain}")
+        })?;
+    }
+
     if opts.apply_caddy {
         caddy::apply(
             cfg,
@@ -269,6 +300,96 @@ pub fn scan_site(sites_dir: &Path, client: &str, slug: &str) -> Result<Vec<ScanF
         Ok(())
     })?;
     Ok(findings)
+}
+
+pub fn canonicalize_domain(opts: CanonicalizeDomainOptions) -> Result<CanonicalizeDomainSummary> {
+    validate_slug(&opts.client)?;
+    validate_slug(&opts.slug)?;
+    validate_slug(&opts.network)?;
+    let domain = canonical_domain(&opts.domain);
+    let site_dir = opts.sites_dir.join(&opts.client).join(&opts.slug);
+
+    canonicalize_domain_at_site(
+        &site_dir,
+        &opts.network,
+        &opts.cli_image,
+        &domain,
+        opts.dry_run,
+    )
+}
+
+fn canonicalize_domain_at_site(
+    site_dir: &Path,
+    network: &str,
+    cli_image: &str,
+    domain: &str,
+    dry_run: bool,
+) -> Result<CanonicalizeDomainSummary> {
+    let canonical_url = format!("https://{domain}");
+    let html_dir = site_dir.join("html");
+    let env_file = site_dir.join(".env");
+    if !html_dir.is_dir() {
+        bail!("html dir no existe: {}", html_dir.display());
+    }
+    if !env_file.is_file() {
+        bail!("env file no existe: {}", env_file.display());
+    }
+
+    let mut steps = Vec::new();
+    if dry_run {
+        steps.push("dry-run: no se actualizan home/siteurl ni se purga caché".to_string());
+    } else {
+        run_wp_cli(
+            site_dir,
+            network,
+            cli_image,
+            &["option", "update", "home", &canonical_url],
+        )?;
+        steps.push(format!("home => {canonical_url}"));
+        run_wp_cli(
+            site_dir,
+            network,
+            cli_image,
+            &["option", "update", "siteurl", &canonical_url],
+        )?;
+        steps.push(format!("siteurl => {canonical_url}"));
+    }
+
+    let replacements = [
+        (format!("https://www.{domain}"), canonical_url.clone()),
+        (format!("http://www.{domain}"), canonical_url.clone()),
+        (format!("http://{domain}"), canonical_url.clone()),
+    ];
+    for (old, new) in replacements {
+        let mut args = vec![
+            "search-replace".to_string(),
+            old.clone(),
+            new.clone(),
+            "--all-tables".to_string(),
+            "--skip-columns=guid".to_string(),
+        ];
+        if dry_run {
+            args.push("--dry-run".to_string());
+        }
+        run_wp_cli_owned(site_dir, network, cli_image, &args)?;
+        steps.push(format!(
+            "{}{} -> {}",
+            if dry_run { "dry-run: " } else { "" },
+            old,
+            new
+        ));
+    }
+
+    if !dry_run {
+        run_wp_cli(site_dir, network, cli_image, &["cache", "flush"])?;
+        steps.push("cache flush".to_string());
+    }
+
+    Ok(CanonicalizeDomainSummary {
+        site_dir: site_dir.to_path_buf(),
+        canonical_url,
+        steps,
+    })
 }
 
 fn provision_database_without_app_link(
@@ -1133,27 +1254,52 @@ fn run_search_replace(
     old_domain: &str,
     new_domain: &str,
 ) -> Result<()> {
+    run_wp_cli(
+        site_dir,
+        &opts.network,
+        &opts.cli_image,
+        &[
+            "search-replace",
+            old_domain,
+            new_domain,
+            "--all-tables",
+            "--skip-columns=guid",
+        ],
+    )
+    .wrap_err_with(|| format!("wp search-replace falló: {} -> {}", old_domain, new_domain))
+}
+
+fn run_wp_cli(site_dir: &Path, network: &str, cli_image: &str, args: &[&str]) -> Result<()> {
+    let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    run_wp_cli_owned(site_dir, network, cli_image, &owned)
+}
+
+fn run_wp_cli_owned(
+    site_dir: &Path,
+    network: &str,
+    cli_image: &str,
+    args: &[String],
+) -> Result<()> {
     let status = Command::new("docker")
         .arg("run")
         .arg("--rm")
+        .arg("--user")
+        .arg("0:0")
         .arg("--network")
-        .arg(&opts.network)
+        .arg(network)
         .arg("--env-file")
         .arg(site_dir.join(".env"))
         .arg("-v")
         .arg(format!("{}:/var/www/html", site_dir.join("html").display()))
-        .arg(&opts.cli_image)
+        .arg(cli_image)
         .arg("wp")
-        .arg("search-replace")
-        .arg(old_domain)
-        .arg(new_domain)
-        .arg("--all-tables")
-        .arg("--skip-columns=guid")
+        .args(args)
+        .arg("--path=/var/www/html")
         .arg("--allow-root")
         .status()
-        .wrap_err("ejecutando wp search-replace")?;
+        .wrap_err("ejecutando wp-cli en Docker")?;
     if !status.success() {
-        bail!("wp search-replace falló: {} -> {}", old_domain, new_domain);
+        bail!("wp-cli falló: wp {}", args.join(" "));
     }
     Ok(())
 }
@@ -1423,7 +1569,11 @@ mod tests {
 
         let findings = scan_site(&tmp, "client", "web").unwrap();
 
-        assert!(findings.iter().any(|finding| finding.status == CheckStatus::Fail));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.status == CheckStatus::Fail)
+        );
         let _ = fs::remove_dir_all(tmp);
     }
 
