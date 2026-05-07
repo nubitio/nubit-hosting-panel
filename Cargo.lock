@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "nubit-hosting-panel"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "chrono",
  "clap",

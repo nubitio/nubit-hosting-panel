@@ -127,8 +127,12 @@ pub fn provision(cfg: &Config, store: &Store, opts: ProvisionOptions) -> Result<
     write_compose_file(&compose_file, &opts, &container)?;
 
     if let Some(dump) = dump_path {
+        eprintln!("[wp] dump_path = {}", dump.display());
         backup::restore(cfg, &server, &provisioned.database, dump)
             .wrap_err_with(|| format!("importando dump {}", dump.display()))?;
+        eprintln!("[wp] dump importado OK");
+    } else {
+        eprintln!("[wp] dump_path = None (no se importará dump)");
     }
 
     docker::ensure_network(&opts.network)?;

@@ -136,6 +136,14 @@ fn mariadb_restore(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    eprintln!(
+        "[restore] docker exec {} mariadb -u {} {}  <  {}",
+        server.name,
+        creds.username,
+        database,
+        dump_path.display()
+    );
+
     let mut child = cmd.spawn().wrap_err("ejecutando mariadb vía docker exec")?;
     {
         let stdin = child
@@ -173,7 +181,11 @@ fn mariadb_restore(
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
-        let detail = if detail.is_empty() { "sin output" } else { &detail };
+        let detail = if detail.is_empty() {
+            "sin output"
+        } else {
+            &detail
+        };
         bail!(
             "restore falló para `{}` desde {}:\n{}",
             database,
