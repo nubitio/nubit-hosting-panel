@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{BufRead, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -126,7 +126,6 @@ fn mariadb_restore(
     validate_restore_input(dump_path)?;
     ensure_identifier(database)?;
     let creds = mariadb_creds(cfg, server)?;
-    let input = open_dump(dump_path)?;
 
     let mut cmd = docker_exec_base(server, creds.password.as_deref(), "MYSQL_PWD");
     cmd.arg("mariadb")
@@ -145,35 +144,23 @@ fn mariadb_restore(
             .ok_or_else(|| eyre!("no se pudo abrir stdin de mariadb"))?;
         let mut writer = std::io::BufWriter::new(stdin);
 
-        // Forzamos la DB target al inicio para que cualquier USE del dump no
-        // desvíe las tablas a otra base de datos.
+        // Forzamos la DB target al inicio. El argumento posicional `database`
+        // de mariadb selecciona la DB por defecto, pero un USE en el dump la
+        // pisaría. Inyectamos nuestro propio USE primero y luego el dump raw.
         let use_stmt = format!("USE `{}`;\n", database);
         writer
             .write_all(use_stmt.as_bytes())
             .wrap_err("escribiendo USE statement")?;
 
-        // Filtramos la directiva sandbox mode de MariaDB 11.8+ (bloquea imports
-        // en clientes de versiones anteriores) y cualquier USE/CREATE DATABASE
-        // que pudiera redirigir las tablas.
-        let reader = std::io::BufReader::new(input);
-        for line in reader.lines() {
-            let line = line.wrap_err("leyendo dump")?;
-            let trimmed = line.trim_start();
-            if trimmed.contains("enable the sandbox mode")
-                || trimmed.to_ascii_uppercase().starts_with("USE ")
-                || trimmed.to_ascii_uppercase().starts_with("CREATE DATABASE")
-                || trimmed.to_ascii_uppercase().starts_with("DROP DATABASE")
-            {
-                continue;
-            }
-            match writer
-                .write_all(line.as_bytes())
-                .and_then(|_| writer.write_all(b"\n"))
-            {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => break,
-                Err(e) => return Err(e).wrap_err("escribiendo dump a stdin de mariadb"),
-            }
+        // Copiamos el dump completo sin modificarlo. No filtramos líneas para
+        // evitar problemas con datos binarios o encodings no-UTF8.
+        // El sandbox mode de MariaDB 11.8 (/*M!999999\-...*/) es ignorado
+        // automáticamente por clientes que no lo entienden.
+        let mut input = open_dump(dump_path)?;
+        match std::io::copy(&mut input, &mut writer) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(e).wrap_err("escribiendo dump a stdin de mariadb"),
         }
     }
     let output = child.wait_with_output()?;
